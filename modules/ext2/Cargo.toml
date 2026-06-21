@@ -1,0 +1,12 @@
+[package]
+name = "mochi-ext2-cext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+mochi-cext-abi = { path = "../../crates/cext-abi" }
