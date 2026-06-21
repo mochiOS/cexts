@@ -10,12 +10,12 @@ version = "0.1.0"
 name = "mochi-disk-cext"
 version = "0.1.0"
 dependencies = [
-    "mochi-cext-abi",
+ "mochi-cext-abi",
 ]
 
 [[package]]
 name = "mochi-ext2-cext"
 version = "0.1.0"
 dependencies = [
-    "mochi-cext-abi",
+ "mochi-cext-abi",
 ]

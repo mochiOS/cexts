@@ -4,11 +4,10 @@
 use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering, fence};
 
 use mochi_cext_abi::{
-    EINVAL, EIO, ENOSYS, ENXIO, MCX_CEXT_ABI, MCX_LOG_INFO, McxDiskOps, McxDmaRegion,
-    McxKernelApi,
+    EINVAL, EIO, ENOSYS, ENXIO, MCX_CEXT_ABI, MCX_LOG_INFO, McxDiskOps, McxDmaRegion, McxKernelApi,
 };
 
 const PCI_CONFIG_ADDR: u16 = 0x0cf8;
@@ -36,11 +35,14 @@ const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
 const VIRTIO_STATUS_FAILED: u8 = 128;
 
 const VIRTIO_BLK_T_IN: u32 = 0;
+const VIRTIO_BLK_T_OUT: u32 = 1;
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 const SECTOR_SIZE: usize = 512;
 const QUEUE_ALIGN: usize = 4096;
 const DISK_ID: u32 = 0;
+const PCI_INTERRUPT_LINE_OFFSET: u8 = 0x3c;
 
 #[repr(C, align(16))]
 struct VirtqDesc {
@@ -84,6 +86,9 @@ struct DriverState {
 }
 
 static READY: AtomicBool = AtomicBool::new(false);
+static IRQ_REGISTERED: AtomicBool = AtomicBool::new(false);
+static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+static IRQ_LINE: AtomicU8 = AtomicU8::new(0xff);
 static mut STATE: DriverState = DriverState {
     api: core::ptr::null(),
     io_base: 0,
@@ -216,6 +221,12 @@ unsafe fn pci_config_write_u16(bus: u8, device: u8, func: u8, offset: u8, value:
     outl(PCI_CONFIG_DATA, current);
 }
 
+unsafe fn pci_config_read_u8(bus: u8, device: u8, func: u8, offset: u8) -> u8 {
+    let value = pci_config_read_u32(bus, device, func, offset & !0x3);
+    let shift = ((offset & 0x3) as u32) * 8;
+    ((value >> shift) & 0xff) as u8
+}
+
 unsafe fn find_virtio_blk_legacy() -> Option<(u8, u8, u8, u16)> {
     let mut bus = 0u16;
     while bus <= 255 {
@@ -290,6 +301,11 @@ unsafe fn setup_device(api: *const McxKernelApi) -> i32 {
     let low = inl(io_base + VIRTIO_PCI_DEVICE_SPECIFIC) as u64;
     let high = inl(io_base + VIRTIO_PCI_DEVICE_SPECIFIC + 4) as u64;
     STATE.capacity_sectors = low | (high << 32);
+    let irq_line = pci_config_read_u8(bus, device, func, PCI_INTERRUPT_LINE_OFFSET);
+    if irq_line < 16 && ((*api).register_irq)(irq_line, virtio_irq_handler) == 0 {
+        IRQ_REGISTERED.store(true, Ordering::Release);
+        IRQ_LINE.store(irq_line, Ordering::Release);
+    }
     log_bytes(MCX_LOG_INFO, b"disk.cext: virtio-blk ready");
     READY.store(true, Ordering::Release);
     0
@@ -379,7 +395,52 @@ unsafe fn status_phys() -> u64 {
     STATE.dma.phys + off as u64
 }
 
-unsafe fn submit_read(sector: u64, dst: *mut u8) -> i32 {
+extern "C" fn virtio_irq_handler(_irq: u8) {
+    IRQ_PENDING.store(true, Ordering::Release);
+}
+
+unsafe fn wait_for_completion(io_base: u16, used_before: u16, expect_head: u32) -> i32 {
+    if IRQ_REGISTERED.load(Ordering::Acquire) {
+        let mut spins = 0u32;
+        while !IRQ_PENDING.load(Ordering::Acquire)
+            && read_volatile(core::ptr::addr_of!((*used_ptr()).idx)) == used_before
+        {
+            core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins == 100_000_000 {
+                break;
+            }
+        }
+        IRQ_PENDING.store(false, Ordering::Release);
+    }
+
+    let mut spins = 0u32;
+    while read_volatile(core::ptr::addr_of!((*used_ptr()).idx)) == used_before {
+        core::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if spins == 100_000_000 {
+            log_u8(b"disk.cext: irq_line=", IRQ_LINE.load(Ordering::Acquire));
+            log_u16(
+                b"disk.cext: used.idx=",
+                read_volatile(core::ptr::addr_of!((*used_ptr()).idx)),
+            );
+            log_u8(b"disk.cext: isr=", inb(io_base + VIRTIO_PCI_ISR));
+            log_u8(b"disk.cext: status_reg=", inb(io_base + VIRTIO_PCI_STATUS));
+            return EIO;
+        }
+    }
+    fence(Ordering::SeqCst);
+    let _ = inb(io_base + VIRTIO_PCI_ISR);
+    let used_slot = (used_before % STATE.queue_size) as usize;
+    let used_elem = read_volatile(used_ring_ptr().add(used_slot));
+    if used_elem.id != expect_head {
+        log_u64(b"disk.cext: used.id=", used_elem.id as u64);
+        return EIO;
+    }
+    0
+}
+
+unsafe fn submit_request(sector: u64, src_or_dst: *mut u8, is_write: bool, is_flush: bool) -> i32 {
     let io_base = STATE.io_base;
     let desc = desc_ptr();
     let avail = avail_ptr();
@@ -391,10 +452,17 @@ unsafe fn submit_read(sector: u64, dst: *mut u8) -> i32 {
     let avail_idx = read_volatile(core::ptr::addr_of!((*avail).idx));
     let queue_size = STATE.queue_size;
 
-    (*req).typ = VIRTIO_BLK_T_IN;
+    (*req).typ = if is_flush {
+        VIRTIO_BLK_T_FLUSH
+    } else if is_write {
+        VIRTIO_BLK_T_OUT
+    } else {
+        VIRTIO_BLK_T_IN
+    };
     (*req).reserved = 0;
     (*req).sector = sector;
     write_volatile(status, 0xff);
+    let mut desc_count = 2u16;
 
     write_volatile(desc.add(0), VirtqDesc {
         addr: req_phys(),
@@ -402,13 +470,25 @@ unsafe fn submit_read(sector: u64, dst: *mut u8) -> i32 {
         flags: VIRTQ_DESC_F_NEXT,
         next: 1,
     });
-    write_volatile(desc.add(1), VirtqDesc {
-        addr: data_phys(),
-        len: SECTOR_SIZE as u32,
-        flags: VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
-        next: 2,
-    });
-    write_volatile(desc.add(2), VirtqDesc {
+
+    if !is_flush {
+        if is_write {
+            let mut i = 0usize;
+            while i < SECTOR_SIZE {
+                *data.add(i) = *src_or_dst.add(i);
+                i += 1;
+            }
+        }
+        write_volatile(desc.add(1), VirtqDesc {
+            addr: data_phys(),
+            len: SECTOR_SIZE as u32,
+            flags: if is_write { VIRTQ_DESC_F_NEXT } else { VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT },
+            next: 2,
+        });
+        desc_count = 3;
+    }
+
+    write_volatile(desc.add(desc_count as usize - 1), VirtqDesc {
         addr: status_phys(),
         len: 1,
         flags: VIRTQ_DESC_F_WRITE,
@@ -420,45 +500,23 @@ unsafe fn submit_read(sector: u64, dst: *mut u8) -> i32 {
     fence(Ordering::SeqCst);
     write_volatile(core::ptr::addr_of_mut!((*avail).idx), avail_idx.wrapping_add(1));
     fence(Ordering::SeqCst);
+    IRQ_PENDING.store(false, Ordering::Release);
     outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-    let mut spins = 0u32;
-    while read_volatile(core::ptr::addr_of!((*used).idx)) == used_before {
-        core::hint::spin_loop();
-        spins = spins.wrapping_add(1);
-        if spins == 100_000_000 {
-            log_u64(b"disk.cext: timeout sector=", sector);
-            log_u16(
-                b"disk.cext: used.idx=",
-                read_volatile(core::ptr::addr_of!((*used).idx)),
-            );
-            log_u8(
-                b"disk.cext: isr=",
-                inb(io_base + VIRTIO_PCI_ISR),
-            );
-            log_u8(
-                b"disk.cext: status_reg=",
-                inb(io_base + VIRTIO_PCI_STATUS),
-            );
-            return EIO;
-        }
-    }
-    fence(Ordering::SeqCst);
-    let _ = inb(io_base + VIRTIO_PCI_ISR);
-    let used_slot = (used_before % queue_size) as usize;
-    let used_elem = read_volatile(used_ring_ptr().add(used_slot));
-    if used_elem.id != 0 {
-        log_u64(b"disk.cext: used.id=", used_elem.id as u64);
-        return EIO;
+    let rc = wait_for_completion(io_base, used_before, 0);
+    if rc != 0 {
+        return rc;
     }
     if read_volatile(status) != 0 {
         log_u64(b"disk.cext: status error sector=", sector);
         return EIO;
     }
-    let mut i = 0usize;
-    while i < SECTOR_SIZE {
-        *dst.add(i) = *data.add(i);
-        i += 1;
+    if !is_write && !is_flush {
+        let mut i = 0usize;
+        while i < SECTOR_SIZE {
+            *src_or_dst.add(i) = *data.add(i);
+            i += 1;
+        }
     }
     0
 }
@@ -488,7 +546,7 @@ extern "C" fn read_sector_impl(disk_id: u32, lba: u64, buf: *mut u8, buf_len: us
         }
         let mut i = 0usize;
         while i < sectors {
-            let rc = submit_read(lba + i as u64, buf.add(i * SECTOR_SIZE));
+            let rc = submit_request(lba + i as u64, buf.add(i * SECTOR_SIZE), false, false);
             if rc != 0 {
                 return rc;
             }
@@ -499,18 +557,55 @@ extern "C" fn read_sector_impl(disk_id: u32, lba: u64, buf: *mut u8, buf_len: us
 }
 
 extern "C" fn write_sector_impl(
-    _disk_id: u32,
-    _lba: u64,
-    _buf: *const u8,
-    _buf_len: usize,
+    disk_id: u32,
+    lba: u64,
+    buf: *const u8,
+    buf_len: usize,
 ) -> i32 {
-    ENOSYS
+    if !READY.load(Ordering::Acquire) {
+        return ENOSYS;
+    }
+    if disk_id != DISK_ID || buf.is_null() || buf_len == 0 || (buf_len % SECTOR_SIZE) != 0 {
+        return EINVAL;
+    }
+    unsafe {
+        let sectors = buf_len / SECTOR_SIZE;
+        let capacity = STATE.capacity_sectors;
+        if lba.checked_add(sectors as u64).is_none() || lba + sectors as u64 > capacity {
+            return EIO;
+        }
+        let mut i = 0usize;
+        while i < sectors {
+            let rc = submit_request(
+                lba + i as u64,
+                buf.add(i * SECTOR_SIZE) as *mut u8,
+                true,
+                false,
+            );
+            if rc != 0 {
+                return rc;
+            }
+            i += 1;
+        }
+    }
+    0
+}
+
+extern "C" fn flush_impl(disk_id: u32) -> i32 {
+    if !READY.load(Ordering::Acquire) {
+        return ENOSYS;
+    }
+    if disk_id != DISK_ID {
+        return EINVAL;
+    }
+    unsafe { submit_request(0, core::ptr::null_mut(), false, true) }
 }
 
 static OPS: McxDiskOps = McxDiskOps {
     probe: probe_impl,
     read_sector: read_sector_impl,
     write_sector: write_sector_impl,
+    flush: flush_impl,
 };
 
 #[unsafe(no_mangle)]

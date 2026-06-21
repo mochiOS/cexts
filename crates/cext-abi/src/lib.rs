@@ -15,6 +15,7 @@ pub struct McxKernelApi {
     pub alloc_dma:
         extern "C" fn(size: usize, align: usize, out_region: *mut McxDmaRegion) -> i32,
     pub log: extern "C" fn(level: u32, ptr: *const u8, len: usize),
+    pub register_irq: extern "C" fn(irq: u8, handler: extern "C" fn(u8)) -> i32,
 }
 
 #[repr(C)]
@@ -36,6 +37,7 @@ pub struct McxDiskOps {
     pub probe: extern "C" fn() -> i32,
     pub read_sector: extern "C" fn(disk_id: u32, lba: u64, buf: *mut u8, buf_len: usize) -> i32,
     pub write_sector: extern "C" fn(disk_id: u32, lba: u64, buf: *const u8, buf_len: usize) -> i32,
+    pub flush: extern "C" fn(disk_id: u32) -> i32,
 }
 
 #[repr(C)]
@@ -64,7 +66,9 @@ pub const ENOENT: i32 = -2;
 pub const EIO: i32 = -5;
 pub const ENXIO: i32 = -6;
 pub const EFAULT: i32 = -14;
+pub const EEXIST: i32 = -17;
 pub const EINVAL: i32 = -22;
 pub const EISDIR: i32 = -21;
 pub const ENOTDIR: i32 = -20;
+pub const ENOSPC: i32 = -28;
 pub const ENOSYS: i32 = -38;
