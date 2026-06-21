@@ -1,0 +1,16 @@
+[cext]
+id = "org.mochios.cexts.disk"
+name = "disk"
+version = 1
+abi = 1
+entry = "entry"
+
+[load]
+stage = "boot"
+required = true
+
+[provides]
+interfaces = ["block.device"]
+
+[requires]
+interfaces = []

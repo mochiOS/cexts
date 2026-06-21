@@ -1,0 +1,16 @@
+[cext]
+id = "org.mochios.cexts.ext2"
+name = "ext2"
+version = 1
+abi = 1
+entry = "entry"
+
+[load]
+stage = "boot"
+required = true
+
+[provides]
+interfaces = ["filesystem.ext2"]
+
+[requires]
+interfaces = ["block.device"]
