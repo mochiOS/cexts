@@ -82,6 +82,13 @@ fn log_str(text: &str) {
     log_bytes(text.as_bytes());
 }
 
+fn debug_trace_path(prefix: &str, path: &[u8]) {
+    if path != b"/drivers/usb" && path != b"/drivers" {
+        return;
+    }
+    log_str(prefix);
+}
+
 fn path_bytes(path: McxPath) -> Option<&'static [u8]> {
     if path.ptr.is_null() {
         return None;
@@ -397,6 +404,7 @@ fn lookup_name_in_dir(dir_ino: u32, name: &[u8]) -> Result<u32, i32> {
 }
 
 fn resolve_path(path: &[u8]) -> Result<(u32, Inode), i32> {
+    debug_trace_path("ext2: resolve_path\n", path);
     if path.is_empty() || path[0] != b'/' {
         return Err(EINVAL);
     }
@@ -1023,6 +1031,7 @@ extern "C" fn stat_impl(path: McxPath, out_mode: *mut u16, out_size: *mut u64) -
     let Some(path) = path_bytes(path) else {
         return EINVAL;
     };
+    debug_trace_path("ext2: stat\n", path);
     let inode = match resolve_path(path) {
         Ok((_, inode)) => inode,
         Err(rc) => return rc,
@@ -1041,6 +1050,7 @@ extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -
     let Some(path) = path_bytes(path) else {
         return EINVAL;
     };
+    debug_trace_path("ext2: readdir\n", path);
     let (_, inode) = match resolve_path(path) {
         Ok(v) => v,
         Err(rc) => return rc,
