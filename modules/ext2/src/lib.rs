@@ -861,34 +861,28 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
     let Some(path) = path_bytes(path) else {
         return EINVAL;
     };
-    log_str("ext2.cext: create begin");
     if resolve_path(path).is_ok() {
-        log_str("ext2.cext: create exists");
         return EEXIST;
     }
     let (parent_path, name) = match split_parent(path) {
         Ok(v) => v,
         Err(rc) => {
-            log_str("ext2.cext: create split_parent failed");
             return rc;
         }
     };
     let (parent_ino, parent_inode) = match resolve_path(parent_path) {
         Ok(v) => v,
         Err(rc) => {
-            log_str("ext2.cext: create resolve parent failed");
             return rc;
         }
     };
     if !is_dir(parent_inode.mode) {
-        log_str("ext2.cext: create parent not dir");
         return ENOTDIR;
     }
 
     let ino = match allocate_inode_number() {
         Ok(v) => v,
         Err(rc) => {
-            log_str("ext2.cext: create alloc inode failed");
             return rc;
         }
     };
@@ -915,7 +909,6 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
             Ok(v) => v,
             Err(rc) => {
                 let _ = free_inode_number(ino);
-                log_str("ext2.cext: create dir alloc block failed");
                 return rc;
             }
         };
@@ -923,7 +916,6 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
         if rc != 0 {
             let _ = free_block_number(block);
             let _ = free_inode_number(ino);
-            log_str("ext2.cext: create dir init block failed");
             return rc;
         }
         set_u32(&mut inode_raw, 4, unsafe { STATE.sb }.block_size);
@@ -942,7 +934,6 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
             }
         }
         let _ = free_inode_number(ino);
-        log_str("ext2.cext: create write inode failed");
         return rc;
     }
     if let Err(err) = add_dir_entry(parent_ino, parent_inode, name, ino, file_type) {
@@ -953,19 +944,15 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
             }
         }
         let _ = free_inode_number(ino);
-        log_str("ext2.cext: create add dir entry failed");
         return err;
     }
     if resolve_path(path).is_err() {
-        log_str("ext2.cext: create resolve verify failed");
         return ENOENT;
     }
     let rc = disk_flush();
     if rc != 0 {
-        log_str("ext2.cext: create flush failed");
         return rc;
     }
-    log_str("ext2.cext: create ok");
     0
 }
 
