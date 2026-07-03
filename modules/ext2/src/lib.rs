@@ -16,6 +16,7 @@ const MAX_BLOCK_SIZE: usize = 4096;
 const MAX_INODE_SIZE: usize = 512;
 const SECTOR_SIZE: usize = 512;
 const EXT2_FT_REG_FILE: u8 = 1;
+const EXT2_FT_DIR: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -691,7 +692,13 @@ fn load_inode_from_raw(raw: &[u8]) -> Inode {
     }
 }
 
-fn add_dir_entry(parent_ino: u32, parent_inode: Inode, name: &[u8], child_ino: u32) -> Result<(), i32> {
+fn add_dir_entry(
+    parent_ino: u32,
+    parent_inode: Inode,
+    name: &[u8],
+    child_ino: u32,
+    file_type: u8,
+) -> Result<(), i32> {
     let sb = unsafe { STATE.sb };
     let needed_len = 8 + round_up_4(name.len());
     let mut block_buf = [0u8; MAX_BLOCK_SIZE];
@@ -722,7 +729,7 @@ fn add_dir_entry(parent_ino: u32, parent_inode: Inode, name: &[u8], child_ino: u
                 block_buf[new_off..new_off + 4].copy_from_slice(&child_ino.to_le_bytes());
                 block_buf[new_off + 4..new_off + 6].copy_from_slice(&(remaining as u16).to_le_bytes());
                 block_buf[new_off + 6] = name.len() as u8;
-                block_buf[new_off + 7] = EXT2_FT_REG_FILE;
+                block_buf[new_off + 7] = file_type;
                 block_buf[new_off + 8..new_off + 8 + name.len()].copy_from_slice(name);
                 let rc = write_block(block, &block_buf);
                 if rc != 0 {
@@ -744,7 +751,7 @@ fn add_dir_entry(parent_ino: u32, parent_inode: Inode, name: &[u8], child_ino: u
     block_buf[0..4].copy_from_slice(&child_ino.to_le_bytes());
     block_buf[4..6].copy_from_slice(&(sb.block_size as u16).to_le_bytes());
     block_buf[6] = name.len() as u8;
-    block_buf[7] = EXT2_FT_REG_FILE;
+    block_buf[7] = file_type;
     block_buf[8..8 + name.len()].copy_from_slice(name);
     let rc = write_block(new_block, &block_buf);
     if rc != 0 {
@@ -762,6 +769,26 @@ fn add_dir_entry(parent_ino: u32, parent_inode: Inode, name: &[u8], child_ino: u
         return Err(rc);
     }
     Ok(())
+}
+
+fn init_directory_block(block: u32, self_ino: u32, parent_ino: u32) -> i32 {
+    let sb = unsafe { STATE.sb };
+    let mut block_buf = [0u8; MAX_BLOCK_SIZE];
+    let dot_len = 8 + round_up_4(1);
+    block_buf[0..4].copy_from_slice(&self_ino.to_le_bytes());
+    block_buf[4..6].copy_from_slice(&(dot_len as u16).to_le_bytes());
+    block_buf[6] = 1;
+    block_buf[7] = EXT2_FT_DIR;
+    block_buf[8] = b'.';
+    let dotdot_off = dot_len;
+    block_buf[dotdot_off..dotdot_off + 4].copy_from_slice(&parent_ino.to_le_bytes());
+    block_buf[dotdot_off + 4..dotdot_off + 6]
+        .copy_from_slice(&((sb.block_size as usize - dotdot_off) as u16).to_le_bytes());
+    block_buf[dotdot_off + 6] = 2;
+    block_buf[dotdot_off + 7] = EXT2_FT_DIR;
+    block_buf[dotdot_off + 8] = b'.';
+    block_buf[dotdot_off + 9] = b'.';
+    write_block(block, &block_buf)
 }
 
 fn free_inode_blocks(inode_raw: &mut [u8]) -> Result<(), i32> {
@@ -866,17 +893,65 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
         }
     };
     let mut inode_raw = [0u8; MAX_INODE_SIZE];
-    set_u16(&mut inode_raw, 0, S_IFREG | ((mode as u16) & 0o777));
-    set_u32(&mut inode_raw, 4, 0);
-    set_u16(&mut inode_raw, 26, 1);
-    set_u32(&mut inode_raw, 28, 0);
+    let requested_type = (mode as u16) & 0xf000;
+    let is_directory = requested_type == S_IFDIR;
+    let file_type = if is_directory {
+        EXT2_FT_DIR
+    } else {
+        EXT2_FT_REG_FILE
+    };
+    set_u16(
+        &mut inode_raw,
+        0,
+        if is_directory {
+            S_IFDIR | ((mode as u16) & 0o777)
+        } else {
+            S_IFREG | ((mode as u16) & 0o777)
+        },
+    );
+    set_u16(&mut inode_raw, 26, if is_directory { 2 } else { 1 });
+    if is_directory {
+        let block = match allocate_block_number() {
+            Ok(v) => v,
+            Err(rc) => {
+                let _ = free_inode_number(ino);
+                log_str("ext2.cext: create dir alloc block failed");
+                return rc;
+            }
+        };
+        let rc = init_directory_block(block, ino, parent_ino);
+        if rc != 0 {
+            let _ = free_block_number(block);
+            let _ = free_inode_number(ino);
+            log_str("ext2.cext: create dir init block failed");
+            return rc;
+        }
+        set_u32(&mut inode_raw, 4, unsafe { STATE.sb }.block_size);
+        set_u32(&mut inode_raw, 28, unsafe { STATE.sb }.block_size / 512);
+        set_inode_block_ptr(&mut inode_raw, 0, block);
+    } else {
+        set_u32(&mut inode_raw, 4, 0);
+        set_u32(&mut inode_raw, 28, 0);
+    }
     let rc = write_inode_raw(ino, &inode_raw);
     if rc != 0 {
+        if is_directory {
+            let block = get_u32(&inode_raw, 40);
+            if block != 0 {
+                let _ = free_block_number(block);
+            }
+        }
         let _ = free_inode_number(ino);
         log_str("ext2.cext: create write inode failed");
         return rc;
     }
-    if let Err(err) = add_dir_entry(parent_ino, parent_inode, name, ino) {
+    if let Err(err) = add_dir_entry(parent_ino, parent_inode, name, ino, file_type) {
+        if is_directory {
+            let block = get_u32(&inode_raw, 40);
+            if block != 0 {
+                let _ = free_block_number(block);
+            }
+        }
         let _ = free_inode_number(ino);
         log_str("ext2.cext: create add dir entry failed");
         return err;
