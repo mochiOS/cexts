@@ -4,8 +4,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use mochi_cext_abi::{
-    EEXIST, EINVAL, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, MCX_CEXT_ABI, MCX_LOG_INFO,
-    McxBuffer, McxDiskOps, McxFsOps, McxKernelApi, McxPath,
+    McxBuffer, McxDiskOps, McxFsOps, McxKernelApi, McxPath, EEXIST, EINVAL, EISDIR, ENOENT,
+    ENOSPC, ENOSYS, ENOTDIR, MCX_CEXT_ABI, MCX_LOG_INFO,
 };
 
 const EXT2_MAGIC: u16 = 0xef53;
