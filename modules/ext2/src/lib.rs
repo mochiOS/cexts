@@ -4,8 +4,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use mochi_cext_abi::{
-    McxBuffer, McxDiskOps, McxFsOps, McxKernelApi, McxPath, EEXIST, EINVAL, EISDIR, ENOENT,
-    ENOSPC, ENOSYS, ENOTDIR, MCX_CEXT_ABI, MCX_LOG_INFO,
+    EEXIST, EINVAL, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, MCX_CEXT_ABI, MCX_LOG_INFO, McxBuffer,
+    McxDiskOps, McxFsOps, McxKernelApi, McxPath,
 };
 
 const EXT2_MAGIC: u16 = 0xef53;
@@ -208,7 +208,12 @@ fn set_u32(buf: &mut [u8], offset: usize, value: u32) {
 }
 
 fn get_u32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 fn get_u64(buf: &[u8], offset: usize) -> u64 {
@@ -383,8 +388,8 @@ fn load_inode(ino: u32) -> Result<Inode, i32> {
     let group = index / sb.inodes_per_group;
     let index_in_group = index % sb.inodes_per_group;
     let gd = load_group_desc(sb, group)?;
-    let inode_offset = gd.inode_table as u64 * sb.block_size as u64
-        + index_in_group as u64 * sb.inode_size as u64;
+    let inode_offset =
+        gd.inode_table as u64 * sb.block_size as u64 + index_in_group as u64 * sb.inode_size as u64;
 
     let mut blocks = [0u32; 15];
     let mut i = 0usize;
@@ -407,7 +412,10 @@ fn read_indirect_entry(block: u32, index: usize) -> Result<u32, i32> {
 
 fn write_indirect_entry(block: u32, index: usize, value: u32) -> i32 {
     let sb = unsafe { STATE.sb };
-    write_u32(block as u64 * sb.block_size as u64 + (index * 4) as u64, value)
+    write_u32(
+        block as u64 * sb.block_size as u64 + (index * 4) as u64,
+        value,
+    )
 }
 
 fn data_block_number(inode: Inode, block_index: usize) -> Result<u32, i32> {
@@ -549,7 +557,11 @@ fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), i32> {
     if name.is_empty() {
         return Err(EINVAL);
     }
-    let parent = if slash == 0 { b"/".as_slice() } else { &trimmed[..slash] };
+    let parent = if slash == 0 {
+        b"/".as_slice()
+    } else {
+        &trimmed[..slash]
+    };
     Ok((parent, name))
 }
 
@@ -564,7 +576,7 @@ fn read_file_bytes(inode: Inode, offset: u64, out: &mut [u8]) -> Result<usize, i
     let mut copied = 0usize;
     let mut file_off = offset as usize;
     let limit = core::cmp::min(out.len(), inode.size as usize - file_off);
-    let mut sector = [0u8; SECTOR_SIZE];
+    let mut block_buf = [0u8; MAX_BLOCK_SIZE];
     while copied < limit {
         let block_index = file_off / sb.block_size as usize;
         let within_block = file_off % sb.block_size as usize;
@@ -572,15 +584,12 @@ fn read_file_bytes(inode: Inode, offset: u64, out: &mut [u8]) -> Result<usize, i
         if data_block == 0 {
             return Ok(copied);
         }
-        let block_abs = data_block as u64 * sb.block_size as u64 + within_block as u64;
-        let sector_lba = block_abs / SECTOR_SIZE as u64;
-        let sector_off = (block_abs % SECTOR_SIZE as u64) as usize;
-        let rc = unsafe { disk_read(sector_lba, sector.as_mut_ptr(), SECTOR_SIZE) };
+        let rc = read_block(data_block, &mut block_buf);
         if rc != 0 {
             return Err(rc);
         }
-        let take = core::cmp::min(SECTOR_SIZE - sector_off, limit - copied);
-        out[copied..copied + take].copy_from_slice(&sector[sector_off..sector_off + take]);
+        let take = core::cmp::min(sb.block_size as usize - within_block, limit - copied);
+        out[copied..copied + take].copy_from_slice(&block_buf[within_block..within_block + take]);
         copied += take;
         file_off += take;
     }
@@ -743,7 +752,10 @@ fn set_data_block_number(inode_raw: &mut [u8], block_index: usize, value: u32) -
             return Err(rc);
         }
         set_inode_block_ptr(inode_raw, 12, indirect);
-        set_inode_blocks_512(inode_raw, inode_blocks_512(inode_raw) + (sb.block_size / 512));
+        set_inode_blocks_512(
+            inode_raw,
+            inode_blocks_512(inode_raw) + (sb.block_size / 512),
+        );
     }
     let rc = write_indirect_entry(indirect, single_index, value);
     if rc != 0 {
@@ -766,7 +778,10 @@ fn ensure_data_block(inode_raw: &mut [u8], block_index: usize) -> Result<u32, i3
     }
     set_data_block_number(inode_raw, block_index, block)?;
     let sb = unsafe { STATE.sb };
-    set_inode_blocks_512(inode_raw, inode_blocks_512(inode_raw) + (sb.block_size / 512));
+    set_inode_blocks_512(
+        inode_raw,
+        inode_blocks_512(inode_raw) + (sb.block_size / 512),
+    );
     Ok(block)
 }
 
@@ -819,7 +834,8 @@ fn add_dir_entry(
                 block_buf[off + 4..off + 6].copy_from_slice(&(ideal as u16).to_le_bytes());
                 let new_off = off + ideal;
                 block_buf[new_off..new_off + 4].copy_from_slice(&child_ino.to_le_bytes());
-                block_buf[new_off + 4..new_off + 6].copy_from_slice(&(remaining as u16).to_le_bytes());
+                block_buf[new_off + 4..new_off + 6]
+                    .copy_from_slice(&(remaining as u16).to_le_bytes());
                 block_buf[new_off + 6] = name.len() as u8;
                 block_buf[new_off + 7] = file_type;
                 block_buf[new_off + 8..new_off + 8 + name.len()].copy_from_slice(name);
@@ -1078,7 +1094,12 @@ extern "C" fn read_impl(path: McxPath, offset: u64, buf: McxBuffer, out_read: *m
     }
 }
 
-extern "C" fn write_impl(path: McxPath, offset: u64, buf: McxBuffer, out_written: *mut usize) -> i32 {
+extern "C" fn write_impl(
+    path: McxPath,
+    offset: u64,
+    buf: McxBuffer,
+    out_written: *mut usize,
+) -> i32 {
     if buf.ptr.is_null() || out_written.is_null() {
         return EINVAL;
     }
@@ -1249,7 +1270,9 @@ extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -
                 let name = &block_buf[off + 8..off + 8 + name_len];
                 if name != b"." && name != b".." {
                     if written + name_len + 1 > dst.len() {
-                        unsafe { *out_len = written; }
+                        unsafe {
+                            *out_len = written;
+                        }
                         return 0;
                     }
                     dst[written..written + name_len].copy_from_slice(name);
