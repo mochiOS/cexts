@@ -9,6 +9,7 @@ use mochi_cext_abi::{
 };
 
 const EXT2_MAGIC: u16 = 0xef53;
+const GPT_HEADER_SIGNATURE: &[u8; 8] = b"EFI PART";
 const ROOT_INO: u32 = 2;
 const S_IFDIR: u16 = 0x4000;
 const S_IFREG: u16 = 0x8000;
@@ -50,6 +51,7 @@ struct State {
     disk_ops: *const McxDiskOps,
     mounted: bool,
     disk_id: u32,
+    partition_lba_base: u64,
     sb: Superblock,
 }
 
@@ -58,6 +60,7 @@ static mut STATE: State = State {
     disk_ops: core::ptr::null(),
     mounted: false,
     disk_id: 0,
+    partition_lba_base: 0,
     sb: Superblock {
         blocks_count: 0,
         block_size: 0,
@@ -120,7 +123,7 @@ fn disk_flush() -> i32 {
     }
 }
 
-fn read_exact(offset: u64, out: &mut [u8]) -> i32 {
+fn read_exact_raw(offset: u64, out: &mut [u8]) -> i32 {
     let mut done = 0usize;
     while done < out.len() {
         let absolute = offset + done as u64;
@@ -138,7 +141,7 @@ fn read_exact(offset: u64, out: &mut [u8]) -> i32 {
     0
 }
 
-fn write_exact(offset: u64, data: &[u8]) -> i32 {
+fn write_exact_raw(offset: u64, data: &[u8]) -> i32 {
     let mut done = 0usize;
     while done < data.len() {
         let absolute = offset + done as u64;
@@ -158,6 +161,16 @@ fn write_exact(offset: u64, data: &[u8]) -> i32 {
         done += take;
     }
     0
+}
+
+fn read_exact(offset: u64, out: &mut [u8]) -> i32 {
+    let base = unsafe { STATE.partition_lba_base } * SECTOR_SIZE as u64;
+    read_exact_raw(base + offset, out)
+}
+
+fn write_exact(offset: u64, data: &[u8]) -> i32 {
+    let base = unsafe { STATE.partition_lba_base } * SECTOR_SIZE as u64;
+    write_exact_raw(base + offset, data)
 }
 
 fn read_u16(offset: u64) -> Result<u16, i32> {
@@ -198,6 +211,19 @@ fn get_u32(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
 }
 
+fn get_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
 fn round_up_4(value: usize) -> usize {
     (value + 3) & !3
 }
@@ -234,6 +260,72 @@ fn load_superblock() -> Result<Superblock, i32> {
         inodes_per_group: read_u32(1024 + 40)?,
         inodes_count: read_u32(1024)?,
     })
+}
+
+fn try_mount_at_lba(base_lba: u64) -> Result<Superblock, i32> {
+    unsafe {
+        STATE.partition_lba_base = base_lba;
+    }
+    load_superblock()
+}
+
+fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
+    match try_mount_at_lba(0) {
+        Ok(sb) => return Ok((0, sb)),
+        Err(rc) if rc != EINVAL => return Err(rc),
+        Err(_) => {}
+    }
+
+    let mut header = [0u8; SECTOR_SIZE];
+    let rc = read_exact_raw(SECTOR_SIZE as u64, &mut header);
+    if rc != 0 {
+        return Err(rc);
+    }
+    if &header[0..8] != GPT_HEADER_SIGNATURE {
+        return Err(EINVAL);
+    }
+
+    let entries_lba = get_u64(&header, 72);
+    let entry_count = get_u32(&header, 80);
+    let entry_size = get_u32(&header, 84);
+    if entries_lba == 0 || entry_count == 0 || entry_size < 128 || entry_size > 512 {
+        return Err(EINVAL);
+    }
+
+    let max_entries = core::cmp::min(entry_count, 128);
+    let mut entry = [0u8; 512];
+    let mut index = 0u32;
+    while index < max_entries {
+        let offset = entries_lba
+            .saturating_mul(SECTOR_SIZE as u64)
+            .saturating_add(index as u64 * entry_size as u64);
+        let rc = read_exact_raw(offset, &mut entry[..entry_size as usize]);
+        if rc != 0 {
+            return Err(rc);
+        }
+        let mut empty_type = true;
+        let mut i = 0usize;
+        while i < 16 {
+            if entry[i] != 0 {
+                empty_type = false;
+                break;
+            }
+            i += 1;
+        }
+        if !empty_type {
+            let first_lba = get_u64(&entry, 32);
+            if first_lba != 0 {
+                match try_mount_at_lba(first_lba) {
+                    Ok(sb) => return Ok((first_lba, sb)),
+                    Err(rc) if rc != EINVAL => return Err(rc),
+                    Err(_) => {}
+                }
+            }
+        }
+        index += 1;
+    }
+
+    Err(EINVAL)
 }
 
 fn load_group_desc(sb: Superblock, group: u32) -> Result<GroupDesc, i32> {
@@ -829,8 +921,9 @@ extern "C" fn mount_impl(device_id: u32) -> i32 {
     unsafe {
         STATE.disk_id = device_id;
     }
-    match load_superblock() {
-        Ok(sb) => unsafe {
+    match find_ext2_partition_lba() {
+        Ok((base_lba, sb)) => unsafe {
+            STATE.partition_lba_base = base_lba;
             STATE.sb = sb;
             STATE.mounted = true;
             READY.store(true, Ordering::Release);
