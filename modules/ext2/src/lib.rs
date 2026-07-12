@@ -425,14 +425,33 @@ fn data_block_number(inode: Inode, block_index: usize) -> Result<u32, i32> {
     }
     let entries_per_block = (sb.block_size / 4) as usize;
     let single_index = block_index - 12;
-    if single_index >= entries_per_block {
-        return Err(ENOSYS);
+    if single_index < entries_per_block {
+        let indirect = inode.blocks[12];
+        if indirect == 0 {
+            return Ok(0);
+        }
+        return read_indirect_entry(indirect, single_index);
     }
-    let indirect = inode.blocks[12];
-    if indirect == 0 {
-        return Ok(0);
+
+    let double_index = single_index - entries_per_block;
+    let double_span = entries_per_block
+        .checked_mul(entries_per_block)
+        .ok_or(ENOSYS)?;
+    if double_index < double_span {
+        let double_indirect = inode.blocks[13];
+        if double_indirect == 0 {
+            return Ok(0);
+        }
+        let l1_index = double_index / entries_per_block;
+        let l2_index = double_index % entries_per_block;
+        let indirect = read_indirect_entry(double_indirect, l1_index)?;
+        if indirect == 0 {
+            return Ok(0);
+        }
+        return read_indirect_entry(indirect, l2_index);
     }
-    read_indirect_entry(indirect, single_index)
+
+    Err(ENOSYS)
 }
 
 fn is_dir(mode: u16) -> bool {
@@ -581,15 +600,17 @@ fn read_file_bytes(inode: Inode, offset: u64, out: &mut [u8]) -> Result<usize, i
         let block_index = file_off / sb.block_size as usize;
         let within_block = file_off % sb.block_size as usize;
         let data_block = data_block_number(inode, block_index)?;
-        if data_block == 0 {
-            return Ok(copied);
-        }
-        let rc = read_block(data_block, &mut block_buf);
-        if rc != 0 {
-            return Err(rc);
-        }
         let take = core::cmp::min(sb.block_size as usize - within_block, limit - copied);
-        out[copied..copied + take].copy_from_slice(&block_buf[within_block..within_block + take]);
+        if data_block == 0 {
+            out[copied..copied + take].fill(0);
+        } else {
+            let rc = read_block(data_block, &mut block_buf);
+            if rc != 0 {
+                return Err(rc);
+            }
+            out[copied..copied + take]
+                .copy_from_slice(&block_buf[within_block..within_block + take]);
+        }
         copied += take;
         file_off += take;
     }
