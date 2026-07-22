@@ -16,6 +16,7 @@ const S_IFREG: u16 = 0x8000;
 const MAX_BLOCK_SIZE: usize = 4096;
 const MAX_INODE_SIZE: usize = 512;
 const SECTOR_SIZE: usize = 512;
+const MAX_READ_TRANSFER_BYTES: usize = 64 * 1024;
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
 
@@ -129,6 +130,19 @@ fn read_exact_raw(offset: u64, out: &mut [u8]) -> i32 {
         let absolute = offset + done as u64;
         let lba = absolute / SECTOR_SIZE as u64;
         let sector_off = (absolute % SECTOR_SIZE as u64) as usize;
+        let remaining = out.len() - done;
+        if sector_off == 0 && remaining >= SECTOR_SIZE {
+            let aligned_len = core::cmp::min(
+                remaining - (remaining % SECTOR_SIZE),
+                MAX_READ_TRANSFER_BYTES,
+            );
+            let rc = unsafe { disk_read(lba, out.as_mut_ptr().add(done), aligned_len) };
+            if rc != 0 {
+                return rc;
+            }
+            done += aligned_len;
+            continue;
+        }
         let mut sector = [0u8; SECTOR_SIZE];
         let rc = unsafe { disk_read(lba, sector.as_mut_ptr(), SECTOR_SIZE) };
         if rc != 0 {
@@ -247,23 +261,28 @@ fn inode_offset(sb: Superblock, gd: GroupDesc, index_in_group: u32) -> u64 {
 }
 
 fn load_superblock() -> Result<Superblock, i32> {
-    let magic = read_u16(1024 + 56)?;
+    let mut raw = [0u8; 1024];
+    let rc = read_exact(1024, &mut raw);
+    if rc != 0 {
+        return Err(rc);
+    }
+    let magic = u16::from_le_bytes([raw[56], raw[57]]);
     if magic != EXT2_MAGIC {
         return Err(EINVAL);
     }
-    let log_block_size = read_u32(1024 + 24)?;
+    let log_block_size = get_u32(&raw, 24);
     let block_size = 1024u32.checked_shl(log_block_size).ok_or(EINVAL)?;
     if block_size as usize > MAX_BLOCK_SIZE {
         return Err(EINVAL);
     }
     Ok(Superblock {
-        blocks_count: read_u32(1024 + 4)?,
+        blocks_count: get_u32(&raw, 4),
         block_size,
-        inode_size: read_u16(1024 + 88)?,
-        first_inode: read_u32(1024 + 84)?,
-        blocks_per_group: read_u32(1024 + 32)?,
-        inodes_per_group: read_u32(1024 + 40)?,
-        inodes_count: read_u32(1024)?,
+        inode_size: u16::from_le_bytes([raw[88], raw[89]]),
+        first_inode: get_u32(&raw, 84),
+        blocks_per_group: get_u32(&raw, 32),
+        inodes_per_group: get_u32(&raw, 40),
+        inodes_count: get_u32(&raw, 0),
     })
 }
 
@@ -335,10 +354,15 @@ fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
 
 fn load_group_desc(sb: Superblock, group: u32) -> Result<GroupDesc, i32> {
     let offset = group_desc_offset(sb, group);
+    let mut raw = [0u8; 12];
+    let rc = read_exact(offset, &mut raw);
+    if rc != 0 {
+        return Err(rc);
+    }
     Ok(GroupDesc {
-        block_bitmap: read_u32(offset)?,
-        inode_bitmap: read_u32(offset + 4)?,
-        inode_table: read_u32(offset + 8)?,
+        block_bitmap: get_u32(&raw, 0),
+        inode_bitmap: get_u32(&raw, 4),
+        inode_table: get_u32(&raw, 8),
     })
 }
 
@@ -380,29 +404,9 @@ fn write_inode_raw(ino: u32, data: &[u8]) -> i32 {
 }
 
 fn load_inode(ino: u32) -> Result<Inode, i32> {
-    let sb = unsafe { STATE.sb };
-    if ino < 1 {
-        return Err(EINVAL);
-    }
-    let index = ino - 1;
-    let group = index / sb.inodes_per_group;
-    let index_in_group = index % sb.inodes_per_group;
-    let gd = load_group_desc(sb, group)?;
-    let inode_offset =
-        gd.inode_table as u64 * sb.block_size as u64 + index_in_group as u64 * sb.inode_size as u64;
-
-    let mut blocks = [0u32; 15];
-    let mut i = 0usize;
-    while i < 15 {
-        blocks[i] = read_u32(inode_offset + 40 + (i * 4) as u64)?;
-        i += 1;
-    }
-
-    Ok(Inode {
-        mode: read_u16(inode_offset)?,
-        size: read_u32(inode_offset + 4)?,
-        blocks,
-    })
+    let mut raw = [0u8; MAX_INODE_SIZE];
+    read_inode_raw(ino, &mut raw)?;
+    Ok(load_inode_from_raw(&raw))
 }
 
 fn read_indirect_entry(block: u32, index: usize) -> Result<u32, i32> {
@@ -452,6 +456,44 @@ fn data_block_number(inode: Inode, block_index: usize) -> Result<u32, i32> {
     }
 
     Err(ENOSYS)
+}
+
+struct SingleIndirectCache {
+    block: u32,
+    data: [u8; MAX_BLOCK_SIZE],
+}
+
+impl SingleIndirectCache {
+    const fn new() -> Self {
+        Self {
+            block: 0,
+            data: [0; MAX_BLOCK_SIZE],
+        }
+    }
+
+    fn data_block_number(&mut self, inode: Inode, block_index: usize) -> Result<u32, i32> {
+        if block_index < 12 {
+            return Ok(inode.blocks[block_index]);
+        }
+        let sb = unsafe { STATE.sb };
+        let entries_per_block = (sb.block_size / 4) as usize;
+        let single_index = block_index - 12;
+        if single_index >= entries_per_block {
+            return data_block_number(inode, block_index);
+        }
+        let indirect = inode.blocks[12];
+        if indirect == 0 {
+            return Ok(0);
+        }
+        if self.block != indirect {
+            let rc = read_block(indirect, &mut self.data);
+            if rc != 0 {
+                return Err(rc);
+            }
+            self.block = indirect;
+        }
+        Ok(get_u32(&self.data, single_index * 4))
+    }
 }
 
 fn is_dir(mode: u16) -> bool {
@@ -596,13 +638,39 @@ fn read_file_bytes(inode: Inode, offset: u64, out: &mut [u8]) -> Result<usize, i
     let mut file_off = offset as usize;
     let limit = core::cmp::min(out.len(), inode.size as usize - file_off);
     let mut block_buf = [0u8; MAX_BLOCK_SIZE];
+    let mut indirect_cache = SingleIndirectCache::new();
     while copied < limit {
         let block_index = file_off / sb.block_size as usize;
         let within_block = file_off % sb.block_size as usize;
-        let data_block = data_block_number(inode, block_index)?;
+        let data_block = indirect_cache.data_block_number(inode, block_index)?;
         let take = core::cmp::min(sb.block_size as usize - within_block, limit - copied);
         if data_block == 0 {
             out[copied..copied + take].fill(0);
+        } else if within_block == 0 && take == sb.block_size as usize {
+            let max_run_blocks = core::cmp::min(
+                (limit - copied) / sb.block_size as usize,
+                MAX_READ_TRANSFER_BYTES / sb.block_size as usize,
+            );
+            let mut run_blocks = 1usize;
+            while run_blocks < max_run_blocks {
+                let next_block =
+                    indirect_cache.data_block_number(inode, block_index + run_blocks)?;
+                if next_block != data_block.saturating_add(run_blocks as u32) {
+                    break;
+                }
+                run_blocks += 1;
+            }
+            let run_bytes = run_blocks * sb.block_size as usize;
+            let rc = read_exact(
+                data_block as u64 * sb.block_size as u64,
+                &mut out[copied..copied + run_bytes],
+            );
+            if rc != 0 {
+                return Err(rc);
+            }
+            copied += run_bytes;
+            file_off += run_bytes;
+            continue;
         } else {
             let rc = read_block(data_block, &mut block_buf);
             if rc != 0 {

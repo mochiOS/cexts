@@ -40,6 +40,7 @@ const VIRTIO_BLK_T_FLUSH: u32 = 4;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 const SECTOR_SIZE: usize = 512;
+const MAX_TRANSFER_BYTES: usize = 64 * 1024;
 const QUEUE_ALIGN: usize = 4096;
 const DISK_ID: u32 = 0;
 const PCI_INTERRUPT_LINE_OFFSET: u8 = 0x3c;
@@ -82,6 +83,7 @@ struct DriverState {
     io_base: u16,
     capacity_sectors: u64,
     dma: McxDmaRegion,
+    data_dma: McxDmaRegion,
     queue_size: u16,
 }
 
@@ -94,6 +96,11 @@ static mut STATE: DriverState = DriverState {
     io_base: 0,
     capacity_sectors: 0,
     dma: McxDmaRegion {
+        virt: core::ptr::null_mut(),
+        phys: 0,
+        len: 0,
+    },
+    data_dma: McxDmaRegion {
         virt: core::ptr::null_mut(),
         phys: 0,
         len: 0,
@@ -193,7 +200,7 @@ fn ring_dma_bytes(queue_size: u16) -> usize {
     let used = 6 + (queue_size as usize * size_of::<VirtqUsedElem>());
     let used_off = align_up(desc + avail, QUEUE_ALIGN);
     let req_off = align_up(used_off + used, 16);
-    align_up(req_off + size_of::<VirtioBlkReq>() + SECTOR_SIZE + 1, 4096)
+    align_up(req_off + size_of::<VirtioBlkReq>() + 1, 4096)
 }
 
 unsafe fn pci_config_read_u32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
@@ -287,10 +294,22 @@ unsafe fn setup_device(api: *const McxKernelApi) -> i32 {
         outb(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_FAILED);
         return EIO;
     }
+    let mut data_dma = McxDmaRegion {
+        virt: core::ptr::null_mut(),
+        phys: 0,
+        len: 0,
+    };
+    let rc = ((*api).alloc_dma)(MAX_TRANSFER_BYTES, 4096, &mut data_dma);
+    if rc != 0 || data_dma.virt.is_null() || data_dma.phys == 0 || data_dma.len < MAX_TRANSFER_BYTES
+    {
+        outb(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_FAILED);
+        return EIO;
+    }
 
     STATE.api = api;
     STATE.io_base = io_base;
     STATE.dma = dma;
+    STATE.data_dma = data_dma;
     STATE.queue_size = queue_num;
     outl(io_base + VIRTIO_PCI_QUEUE_PFN, (dma.phys >> 12) as u32);
     outb(
@@ -369,12 +388,12 @@ unsafe fn req_ptr() -> *mut VirtioBlkReq {
 
 #[inline(always)]
 unsafe fn data_ptr() -> *mut u8 {
-    (req_ptr() as *mut u8).add(size_of::<VirtioBlkReq>())
+    STATE.data_dma.virt
 }
 
 #[inline(always)]
 unsafe fn status_ptr() -> *mut u8 {
-    data_ptr().add(SECTOR_SIZE)
+    (req_ptr() as *mut u8).add(size_of::<VirtioBlkReq>())
 }
 
 #[inline(always)]
@@ -385,8 +404,7 @@ unsafe fn req_phys() -> u64 {
 
 #[inline(always)]
 unsafe fn data_phys() -> u64 {
-    let off = (data_ptr() as usize).saturating_sub(STATE.dma.virt as usize);
-    STATE.dma.phys + off as u64
+    STATE.data_dma.phys
 }
 
 #[inline(always)]
@@ -440,7 +458,21 @@ unsafe fn wait_for_completion(io_base: u16, used_before: u16, expect_head: u32) 
     0
 }
 
-unsafe fn submit_request(sector: u64, src_or_dst: *mut u8, is_write: bool, is_flush: bool) -> i32 {
+unsafe fn submit_request(
+    sector: u64,
+    src_or_dst: *mut u8,
+    byte_len: usize,
+    is_write: bool,
+    is_flush: bool,
+) -> i32 {
+    if !is_flush
+        && (src_or_dst.is_null()
+            || byte_len == 0
+            || byte_len > MAX_TRANSFER_BYTES
+            || byte_len % SECTOR_SIZE != 0)
+    {
+        return EINVAL;
+    }
     let io_base = STATE.io_base;
     let desc = desc_ptr();
     let avail = avail_ptr();
@@ -464,41 +496,57 @@ unsafe fn submit_request(sector: u64, src_or_dst: *mut u8, is_write: bool, is_fl
     write_volatile(status, 0xff);
     let mut desc_count = 2u16;
 
-    write_volatile(desc.add(0), VirtqDesc {
-        addr: req_phys(),
-        len: size_of::<VirtioBlkReq>() as u32,
-        flags: VIRTQ_DESC_F_NEXT,
-        next: 1,
-    });
+    write_volatile(
+        desc.add(0),
+        VirtqDesc {
+            addr: req_phys(),
+            len: size_of::<VirtioBlkReq>() as u32,
+            flags: VIRTQ_DESC_F_NEXT,
+            next: 1,
+        },
+    );
 
     if !is_flush {
         if is_write {
             let mut i = 0usize;
-            while i < SECTOR_SIZE {
+            while i < byte_len {
                 *data.add(i) = *src_or_dst.add(i);
                 i += 1;
             }
         }
-        write_volatile(desc.add(1), VirtqDesc {
-            addr: data_phys(),
-            len: SECTOR_SIZE as u32,
-            flags: if is_write { VIRTQ_DESC_F_NEXT } else { VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT },
-            next: 2,
-        });
+        write_volatile(
+            desc.add(1),
+            VirtqDesc {
+                addr: data_phys(),
+                len: byte_len as u32,
+                flags: if is_write {
+                    VIRTQ_DESC_F_NEXT
+                } else {
+                    VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT
+                },
+                next: 2,
+            },
+        );
         desc_count = 3;
     }
 
-    write_volatile(desc.add(desc_count as usize - 1), VirtqDesc {
-        addr: status_phys(),
-        len: 1,
-        flags: VIRTQ_DESC_F_WRITE,
-        next: 0,
-    });
+    write_volatile(
+        desc.add(desc_count as usize - 1),
+        VirtqDesc {
+            addr: status_phys(),
+            len: 1,
+            flags: VIRTQ_DESC_F_WRITE,
+            next: 0,
+        },
+    );
 
     let slot = (avail_idx % queue_size) as usize;
     write_volatile(avail_ring_ptr().add(slot), 0);
     fence(Ordering::SeqCst);
-    write_volatile(core::ptr::addr_of_mut!((*avail).idx), avail_idx.wrapping_add(1));
+    write_volatile(
+        core::ptr::addr_of_mut!((*avail).idx),
+        avail_idx.wrapping_add(1),
+    );
     fence(Ordering::SeqCst);
     IRQ_PENDING.store(false, Ordering::Release);
     outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
@@ -513,7 +561,7 @@ unsafe fn submit_request(sector: u64, src_or_dst: *mut u8, is_write: bool, is_fl
     }
     if !is_write && !is_flush {
         let mut i = 0usize;
-        while i < SECTOR_SIZE {
+        while i < byte_len {
             *src_or_dst.add(i) = *data.add(i);
             i += 1;
         }
@@ -539,29 +587,29 @@ extern "C" fn read_sector_impl(disk_id: u32, lba: u64, buf: *mut u8, buf_len: us
     unsafe {
         let sectors = buf_len / SECTOR_SIZE;
         let capacity = STATE.capacity_sectors;
-        if lba.checked_add(sectors as u64).is_none()
-            || lba + sectors as u64 > capacity
-        {
+        if lba.checked_add(sectors as u64).is_none() || lba + sectors as u64 > capacity {
             return EIO;
         }
         let mut i = 0usize;
         while i < sectors {
-            let rc = submit_request(lba + i as u64, buf.add(i * SECTOR_SIZE), false, false);
+            let chunk_sectors = core::cmp::min(sectors - i, MAX_TRANSFER_BYTES / SECTOR_SIZE);
+            let rc = submit_request(
+                lba + i as u64,
+                buf.add(i * SECTOR_SIZE),
+                chunk_sectors * SECTOR_SIZE,
+                false,
+                false,
+            );
             if rc != 0 {
                 return rc;
             }
-            i += 1;
+            i += chunk_sectors;
         }
     }
     0
 }
 
-extern "C" fn write_sector_impl(
-    disk_id: u32,
-    lba: u64,
-    buf: *const u8,
-    buf_len: usize,
-) -> i32 {
+extern "C" fn write_sector_impl(disk_id: u32, lba: u64, buf: *const u8, buf_len: usize) -> i32 {
     if !READY.load(Ordering::Acquire) {
         return ENOSYS;
     }
@@ -576,16 +624,18 @@ extern "C" fn write_sector_impl(
         }
         let mut i = 0usize;
         while i < sectors {
+            let chunk_sectors = core::cmp::min(sectors - i, MAX_TRANSFER_BYTES / SECTOR_SIZE);
             let rc = submit_request(
                 lba + i as u64,
                 buf.add(i * SECTOR_SIZE) as *mut u8,
+                chunk_sectors * SECTOR_SIZE,
                 true,
                 false,
             );
             if rc != 0 {
                 return rc;
             }
-            i += 1;
+            i += chunk_sectors;
         }
     }
     0
@@ -598,7 +648,7 @@ extern "C" fn flush_impl(disk_id: u32) -> i32 {
     if disk_id != DISK_ID {
         return EINVAL;
     }
-    unsafe { submit_request(0, core::ptr::null_mut(), false, true) }
+    unsafe { submit_request(0, core::ptr::null_mut(), 0, false, true) }
 }
 
 static OPS: McxDiskOps = McxDiskOps {
