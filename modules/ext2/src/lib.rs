@@ -1533,8 +1533,7 @@ fn finish_write(out_written: *mut usize, written: usize, rc: i32) -> i32 {
     if written == 0 {
         rc
     } else {
-        let _ = disk_flush();
-        0
+        disk_flush()
     }
 }
 
