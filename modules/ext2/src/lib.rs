@@ -1,6 +1,9 @@
 #![no_std]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+//! Metadata and data writes are flushed synchronously, but this minimal ext2 writer has no
+//! journal. A power loss during an operation can therefore leave the filesystem inconsistent.
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use mochi_cext_abi::{
@@ -371,6 +374,10 @@ fn validate_mount_features(sb: Superblock, writable: bool) -> Result<(), i32> {
         }
     }
     Ok(())
+}
+
+fn validate_write_access(writable: bool) -> Result<(), i32> {
+    if writable { Ok(()) } else { Err(EROFS) }
 }
 
 fn try_mount_at_lba(base_lba: u64) -> Result<Superblock, i32> {
@@ -957,11 +964,7 @@ fn free_block_number(block: u32) -> Result<(), i32> {
 }
 
 fn require_writable() -> Result<(), i32> {
-    if state_is_writable() {
-        Ok(())
-    } else {
-        Err(EROFS)
-    }
+    validate_write_access(state_is_writable())
 }
 
 fn now_seconds() -> u32 {
@@ -1858,9 +1861,59 @@ pub extern "C" fn mochi_module_init(api: *const McxKernelApi) -> *const McxFsOps
     &OPS
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {
         core::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn superblock_with_features(
+        feature_compat: u32,
+        feature_incompat: u32,
+        feature_ro_compat: u32,
+    ) -> Superblock {
+        Superblock {
+            blocks_count: 64,
+            first_data_block: 1,
+            block_size: 1024,
+            inode_size: 128,
+            first_inode: 11,
+            blocks_per_group: 64,
+            inodes_per_group: 32,
+            inodes_count: 32,
+            feature_compat,
+            feature_incompat,
+            feature_ro_compat,
+        }
+    }
+
+    #[test]
+    fn writable_mount_rejects_unsupported_features() {
+        let journal = superblock_with_features(EXT2_FEATURE_COMPAT_HAS_JOURNAL, 0, 0);
+        assert_eq!(validate_mount_features(journal, true), Err(EROFS));
+        assert_eq!(validate_mount_features(journal, false), Ok(()));
+
+        let unknown_ro = superblock_with_features(0, 0, 0x8000_0000);
+        assert_eq!(validate_mount_features(unknown_ro, true), Err(EROFS));
+        assert_eq!(validate_mount_features(unknown_ro, false), Ok(()));
+
+        let unknown_incompat = superblock_with_features(0, 0x8000_0000, 0);
+        assert_eq!(validate_mount_features(unknown_incompat, true), Err(EINVAL));
+        assert_eq!(
+            validate_mount_features(unknown_incompat, false),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn read_only_mount_rejects_mutation() {
+        assert_eq!(validate_write_access(false), Err(EROFS));
+        assert_eq!(validate_write_access(true), Ok(()));
     }
 }
