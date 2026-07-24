@@ -1466,13 +1466,18 @@ extern "C" fn write_impl(
         if !block_existed {
             let rc = write_inode_raw(ino, &inode_raw);
             if rc != 0 {
-                rollback_new_data_block(
+                let rollback_rc = rollback_new_data_block(
+                    ino,
                     &mut inode_raw,
                     block_index,
                     block,
                     inode_before.blocks[12],
                 );
-                return finish_write(out_written, written, rc);
+                return finish_write(
+                    out_written,
+                    written,
+                    if rollback_rc == 0 { rc } else { rollback_rc },
+                );
             }
         }
         let mut block_buf = [0u8; MAX_BLOCK_SIZE];
@@ -1486,13 +1491,18 @@ extern "C" fn write_impl(
         let rc = write_block(block, &block_buf);
         if rc != 0 {
             if !block_existed {
-                rollback_new_data_block(
+                let rollback_rc = rollback_new_data_block(
+                    ino,
                     &mut inode_raw,
                     block_index,
                     block,
                     inode_before.blocks[12],
                 );
-                let _ = write_inode_raw(ino, &inode_raw);
+                return finish_write(
+                    out_written,
+                    written,
+                    if rollback_rc == 0 { rc } else { rollback_rc },
+                );
             }
             return finish_write(out_written, written, rc);
         }
@@ -1529,31 +1539,60 @@ fn finish_write(out_written: *mut usize, written: usize, rc: i32) -> i32 {
 }
 
 fn rollback_new_data_block(
+    ino: u32,
     inode_raw: &mut [u8],
     block_index: usize,
     block: u32,
     old_indirect: u32,
-) {
+) -> i32 {
     let sb = superblock();
     if block_index < 12 {
         set_inode_block_ptr(inode_raw, block_index, 0);
+        set_inode_blocks_512(
+            inode_raw,
+            inode_blocks_512(inode_raw).saturating_sub(sb.block_size / 512),
+        );
+        let rc = write_inode_raw(ino, inode_raw);
+        if rc != 0 {
+            return rc;
+        }
     } else {
         let indirect = get_u32(inode_raw, 40 + 12 * 4);
-        let _ = write_indirect_entry(indirect, block_index - 12, 0);
         if old_indirect == 0 {
             set_inode_block_ptr(inode_raw, 12, 0);
-            let _ = free_block_number(indirect);
             set_inode_blocks_512(
                 inode_raw,
-                inode_blocks_512(inode_raw).saturating_sub(sb.block_size / 512),
+                inode_blocks_512(inode_raw).saturating_sub(2 * (sb.block_size / 512)),
             );
+            let rc = write_inode_raw(ino, inode_raw);
+            if rc != 0 {
+                return rc;
+            }
+            if let Err(rc) = free_block_number(block) {
+                return rc;
+            }
+            return match free_block_number(indirect) {
+                Ok(()) => 0,
+                Err(rc) => rc,
+            };
+        }
+        let rc = write_indirect_entry(indirect, block_index - 12, 0);
+        if rc != 0 {
+            return rc;
+        }
+        set_inode_blocks_512(
+            inode_raw,
+            inode_blocks_512(inode_raw).saturating_sub(sb.block_size / 512),
+        );
+        let rc = write_inode_raw(ino, inode_raw);
+        if rc != 0 {
+            return rc;
         }
     }
-    let _ = free_block_number(block);
-    set_inode_blocks_512(
-        inode_raw,
-        inode_blocks_512(inode_raw).saturating_sub(sb.block_size / 512),
-    );
+    match free_block_number(block) {
+        Ok(()) => 0,
+        Err(rc) => rc,
+    }
 }
 
 extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
