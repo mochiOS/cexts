@@ -4,8 +4,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use mochi_cext_abi::{
-    EEXIST, EINVAL, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, MCX_CEXT_ABI, MCX_LOG_INFO, McxBuffer,
-    McxDiskOps, McxFsOps, McxKernelApi, McxPath,
+    EEXIST, EFBIG, EINVAL, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, EOVERFLOW, EROFS, MCX_CEXT_ABI,
+    MCX_FS_MOUNT_READ_ONLY, MCX_LOG_INFO, McxBuffer, McxDiskOps, McxFsOps, McxKernelApi, McxPath,
 };
 
 const EXT2_MAGIC: u16 = 0xef53;
@@ -19,17 +19,27 @@ const SECTOR_SIZE: usize = 512;
 const MAX_READ_TRANSFER_BYTES: usize = 64 * 1024;
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
+const EXT2_INDEX_FL: u32 = 0x0000_1000;
+const EXT2_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+const EXT2_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
+const EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+const EXT2_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
+const MAX_WRITABLE_BLOCKS: usize = 12 + MAX_BLOCK_SIZE / 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Superblock {
     blocks_count: u32,
+    first_data_block: u32,
     block_size: u32,
     inode_size: u16,
     first_inode: u32,
     blocks_per_group: u32,
     inodes_per_group: u32,
     inodes_count: u32,
+    feature_compat: u32,
+    feature_incompat: u32,
+    feature_ro_compat: u32,
 }
 
 #[repr(C)]
@@ -45,12 +55,14 @@ struct GroupDesc {
 struct Inode {
     mode: u16,
     size: u32,
+    flags: u32,
     blocks: [u32; 15],
 }
 
 struct State {
     disk_ops: *const McxDiskOps,
     mounted: bool,
+    writable: bool,
     disk_id: u32,
     partition_lba_base: u64,
     sb: Superblock,
@@ -64,15 +76,28 @@ static mut STATE: State = State {
     partition_lba_base: 0,
     sb: Superblock {
         blocks_count: 0,
+        first_data_block: 0,
         block_size: 0,
         inode_size: 0,
         first_inode: 0,
         blocks_per_group: 0,
         inodes_per_group: 0,
         inodes_count: 0,
+        feature_compat: 0,
+        feature_incompat: 0,
+        feature_ro_compat: 0,
     },
+    writable: false,
 };
 static mut KERNEL_API: *const McxKernelApi = core::ptr::null();
+
+fn superblock() -> Superblock {
+    unsafe { STATE.sb }
+}
+
+fn state_is_writable() -> bool {
+    unsafe { STATE.writable }
+}
 
 fn log_bytes(bytes: &[u8]) {
     unsafe {
@@ -213,8 +238,34 @@ fn write_u32(offset: u64, value: u32) -> i32 {
     write_exact(offset, &value.to_le_bytes())
 }
 
+fn decrement_u32_at(offset: u64) -> Result<(), i32> {
+    let value = read_u32(offset)?;
+    if value == 0 {
+        return Err(ENOSPC);
+    }
+    let rc = write_u32(offset, value - 1);
+    if rc != 0 {
+        return Err(rc);
+    }
+    Ok(())
+}
+
+fn increment_u32_at(offset: u64) -> Result<(), i32> {
+    let value = read_u32(offset)?;
+    let next = value.checked_add(1).ok_or(EOVERFLOW)?;
+    let rc = write_u32(offset, next);
+    if rc != 0 {
+        return Err(rc);
+    }
+    Ok(())
+}
+
 fn set_u16(buf: &mut [u8], offset: usize, value: u16) {
     buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
 }
 
 fn set_u32(buf: &mut [u8], offset: usize, value: u32) {
@@ -275,15 +326,51 @@ fn load_superblock() -> Result<Superblock, i32> {
     if block_size as usize > MAX_BLOCK_SIZE {
         return Err(EINVAL);
     }
-    Ok(Superblock {
+    let inode_size = u16::from_le_bytes([raw[88], raw[89]]);
+    let inode_size = if inode_size == 0 { 128 } else { inode_size };
+    let sb = Superblock {
         blocks_count: get_u32(&raw, 4),
+        first_data_block: get_u32(&raw, 20),
         block_size,
-        inode_size: u16::from_le_bytes([raw[88], raw[89]]),
+        inode_size,
         first_inode: get_u32(&raw, 84),
         blocks_per_group: get_u32(&raw, 32),
         inodes_per_group: get_u32(&raw, 40),
         inodes_count: get_u32(&raw, 0),
-    })
+        feature_compat: get_u32(&raw, 92),
+        feature_incompat: get_u32(&raw, 96),
+        feature_ro_compat: get_u32(&raw, 100),
+    };
+    if sb.blocks_count <= sb.first_data_block
+        || sb.block_size < 1024
+        || !sb.block_size.is_power_of_two()
+        || sb.inode_size < 128
+        || sb.inode_size as usize > MAX_INODE_SIZE
+        || sb.inode_size as u32 > sb.block_size
+        || sb.blocks_per_group == 0
+        || sb.blocks_per_group > sb.block_size * 8
+        || sb.inodes_per_group == 0
+        || sb.inodes_per_group > sb.block_size * 8
+        || sb.inodes_count == 0
+    {
+        return Err(EINVAL);
+    }
+    Ok(sb)
+}
+
+fn validate_mount_features(sb: Superblock, writable: bool) -> Result<(), i32> {
+    if (sb.feature_incompat & !EXT2_FEATURE_INCOMPAT_FILETYPE) != 0 {
+        return Err(EINVAL);
+    }
+    if writable {
+        let supported_ro = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+        if (sb.feature_ro_compat & !supported_ro) != 0
+            || (sb.feature_compat & EXT2_FEATURE_COMPAT_HAS_JOURNAL) != 0
+        {
+            return Err(EROFS);
+        }
+    }
+    Ok(())
 }
 
 fn try_mount_at_lba(base_lba: u64) -> Result<Superblock, i32> {
@@ -367,7 +454,7 @@ fn load_group_desc(sb: Superblock, group: u32) -> Result<GroupDesc, i32> {
 }
 
 fn read_inode_raw(ino: u32, out: &mut [u8]) -> Result<(), i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     if ino < 1 || sb.inode_size as usize > out.len() {
         return Err(EINVAL);
     }
@@ -386,7 +473,7 @@ fn read_inode_raw(ino: u32, out: &mut [u8]) -> Result<(), i32> {
 }
 
 fn write_inode_raw(ino: u32, data: &[u8]) -> i32 {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     if ino < 1 || sb.inode_size as usize > data.len() {
         return EINVAL;
     }
@@ -410,12 +497,12 @@ fn load_inode(ino: u32) -> Result<Inode, i32> {
 }
 
 fn read_indirect_entry(block: u32, index: usize) -> Result<u32, i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     read_u32(block as u64 * sb.block_size as u64 + (index * 4) as u64)
 }
 
 fn write_indirect_entry(block: u32, index: usize, value: u32) -> i32 {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     write_u32(
         block as u64 * sb.block_size as u64 + (index * 4) as u64,
         value,
@@ -423,7 +510,7 @@ fn write_indirect_entry(block: u32, index: usize, value: u32) -> i32 {
 }
 
 fn data_block_number(inode: Inode, block_index: usize) -> Result<u32, i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     if block_index < 12 {
         return Ok(inode.blocks[block_index]);
     }
@@ -475,7 +562,7 @@ impl SingleIndirectCache {
         if block_index < 12 {
             return Ok(inode.blocks[block_index]);
         }
-        let sb = unsafe { STATE.sb };
+        let sb = superblock();
         let entries_per_block = (sb.block_size / 4) as usize;
         let single_index = block_index - 12;
         if single_index >= entries_per_block {
@@ -505,7 +592,7 @@ fn is_file(mode: u16) -> bool {
 }
 
 fn read_block(block: u32, data: &mut [u8]) -> i32 {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     read_exact(
         block as u64 * sb.block_size as u64,
         &mut data[..sb.block_size as usize],
@@ -513,7 +600,7 @@ fn read_block(block: u32, data: &mut [u8]) -> i32 {
 }
 
 fn write_block(block: u32, data: &[u8]) -> i32 {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     write_exact(
         block as u64 * sb.block_size as u64,
         &data[..sb.block_size as usize],
@@ -521,7 +608,7 @@ fn write_block(block: u32, data: &[u8]) -> i32 {
 }
 
 fn lookup_name_in_dir(dir_ino: u32, name: &[u8]) -> Result<u32, i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     let dir = load_inode(dir_ino)?;
     if !is_dir(dir.mode) {
         return Err(ENOTDIR);
@@ -626,8 +713,19 @@ fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), i32> {
     Ok((parent, name))
 }
 
+fn contains_slash(bytes: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'/' {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn read_file_bytes(inode: Inode, offset: u64, out: &mut [u8]) -> Result<usize, i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     if !is_file(inode.mode) {
         return Err(EISDIR);
     }
@@ -699,7 +797,8 @@ fn decrement_u16_at(offset: u64) -> Result<(), i32> {
 
 fn increment_u16_at(offset: u64) -> Result<(), i32> {
     let value = read_u16(offset)?;
-    let rc = write_u16(offset, value + 1);
+    let next = value.checked_add(1).ok_or(EOVERFLOW)?;
+    let rc = write_u16(offset, next);
     if rc != 0 {
         return Err(rc);
     }
@@ -737,6 +836,9 @@ fn clear_bitmap_bit(bitmap_block: u32, bit: u32) -> Result<(), i32> {
     }
     let byte_idx = (bit / 8) as usize;
     let mask = 1u8 << (bit % 8);
+    if (bitmap[byte_idx] & mask) == 0 {
+        return Err(EINVAL);
+    }
     bitmap[byte_idx] &= !mask;
     let rc = write_block(bitmap_block, &bitmap);
     if rc != 0 {
@@ -746,9 +848,9 @@ fn clear_bitmap_bit(bitmap_block: u32, bit: u32) -> Result<(), i32> {
 }
 
 fn allocate_inode_number() -> Result<u32, i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     let groups = sb.inodes_count.div_ceil(sb.inodes_per_group);
-    let group = 0u32;
+    let mut group = 0u32;
     while group < groups {
         let gd = load_group_desc(sb, group)?;
         let start_bit = if group == 0 {
@@ -760,53 +862,122 @@ fn allocate_inode_number() -> Result<u32, i32> {
             sb.inodes_per_group,
             sb.inodes_count.saturating_sub(group * sb.inodes_per_group),
         );
-        let bit = alloc_bitmap_bit(gd.inode_bitmap, start_bit, max_bits)?;
-        decrement_u16_at(1024 + 16)?;
-        decrement_u16_at(group_desc_offset(sb, group) + 14)?;
-        return Ok(group * sb.inodes_per_group + bit + 1);
+        match alloc_bitmap_bit(gd.inode_bitmap, start_bit, max_bits) {
+            Ok(bit) => {
+                if let Err(rc) = decrement_u32_at(1024 + 16) {
+                    let _ = clear_bitmap_bit(gd.inode_bitmap, bit);
+                    return Err(rc);
+                }
+                if let Err(rc) = decrement_u16_at(group_desc_offset(sb, group) + 14) {
+                    let _ = increment_u32_at(1024 + 16);
+                    let _ = clear_bitmap_bit(gd.inode_bitmap, bit);
+                    return Err(rc);
+                }
+                return Ok(group * sb.inodes_per_group + bit + 1);
+            }
+            Err(ENOSPC) => group += 1,
+            Err(rc) => return Err(rc),
+        }
     }
     Err(ENOSPC)
 }
 
 fn free_inode_number(ino: u32) -> Result<(), i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     let index = ino - 1;
     let group = index / sb.inodes_per_group;
     let bit = index % sb.inodes_per_group;
     let gd = load_group_desc(sb, group)?;
     clear_bitmap_bit(gd.inode_bitmap, bit)?;
-    increment_u16_at(1024 + 16)?;
+    increment_u32_at(1024 + 16)?;
     increment_u16_at(group_desc_offset(sb, group) + 14)?;
     Ok(())
 }
 
+fn increment_used_dirs(ino: u32) -> Result<(), i32> {
+    let sb = superblock();
+    let group = (ino - 1) / sb.inodes_per_group;
+    increment_u16_at(group_desc_offset(sb, group) + 16)
+}
+
+fn decrement_used_dirs(ino: u32) -> Result<(), i32> {
+    let sb = superblock();
+    let group = (ino - 1) / sb.inodes_per_group;
+    decrement_u16_at(group_desc_offset(sb, group) + 16)
+}
+
 fn allocate_block_number() -> Result<u32, i32> {
-    let sb = unsafe { STATE.sb };
-    let groups = sb.blocks_count.div_ceil(sb.blocks_per_group);
-    let group = 0u32;
+    let sb = superblock();
+    let data_blocks = sb.blocks_count.saturating_sub(sb.first_data_block);
+    let groups = data_blocks.div_ceil(sb.blocks_per_group);
+    let mut group = 0u32;
     while group < groups {
         let gd = load_group_desc(sb, group)?;
+        let group_base = sb
+            .first_data_block
+            .checked_add(group.saturating_mul(sb.blocks_per_group))
+            .ok_or(EOVERFLOW)?;
         let max_bits = core::cmp::min(
             sb.blocks_per_group,
-            sb.blocks_count.saturating_sub(group * sb.blocks_per_group),
+            sb.blocks_count.saturating_sub(group_base),
         );
-        let bit = alloc_bitmap_bit(gd.block_bitmap, 0, max_bits)?;
-        decrement_u16_at(1024 + 12)?;
-        decrement_u16_at(group_desc_offset(sb, group) + 12)?;
-        return Ok(group * sb.blocks_per_group + bit);
+        match alloc_bitmap_bit(gd.block_bitmap, 0, max_bits) {
+            Ok(bit) => {
+                if let Err(rc) = decrement_u32_at(1024 + 12) {
+                    let _ = clear_bitmap_bit(gd.block_bitmap, bit);
+                    return Err(rc);
+                }
+                if let Err(rc) = decrement_u16_at(group_desc_offset(sb, group) + 12) {
+                    let _ = increment_u32_at(1024 + 12);
+                    let _ = clear_bitmap_bit(gd.block_bitmap, bit);
+                    return Err(rc);
+                }
+                return Ok(group_base + bit);
+            }
+            Err(ENOSPC) => group += 1,
+            Err(rc) => return Err(rc),
+        }
     }
     Err(ENOSPC)
 }
 
 fn free_block_number(block: u32) -> Result<(), i32> {
-    let sb = unsafe { STATE.sb };
-    let group = block / sb.blocks_per_group;
-    let bit = block % sb.blocks_per_group;
+    let sb = superblock();
+    if block < sb.first_data_block || block >= sb.blocks_count {
+        return Err(EINVAL);
+    }
+    let relative = block - sb.first_data_block;
+    let group = relative / sb.blocks_per_group;
+    let bit = relative % sb.blocks_per_group;
     let gd = load_group_desc(sb, group)?;
     clear_bitmap_bit(gd.block_bitmap, bit)?;
-    increment_u16_at(1024 + 12)?;
+    increment_u32_at(1024 + 12)?;
     increment_u16_at(group_desc_offset(sb, group) + 12)?;
     Ok(())
+}
+
+fn require_writable() -> Result<(), i32> {
+    if state_is_writable() {
+        Ok(())
+    } else {
+        Err(EROFS)
+    }
+}
+
+fn now_seconds() -> u32 {
+    unsafe {
+        if KERNEL_API.is_null() {
+            0
+        } else {
+            ((*KERNEL_API).now_seconds)()
+        }
+    }
+}
+
+fn update_change_times(inode_raw: &mut [u8]) {
+    let now = now_seconds();
+    set_u32(inode_raw, 12, now);
+    set_u32(inode_raw, 16, now);
 }
 
 fn inode_blocks_512(inode_raw: &[u8]) -> u32 {
@@ -822,7 +993,7 @@ fn set_inode_block_ptr(inode_raw: &mut [u8], block_index: usize, value: u32) {
 }
 
 fn set_data_block_number(inode_raw: &mut [u8], block_index: usize, value: u32) -> Result<(), i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     if block_index < 12 {
         set_inode_block_ptr(inode_raw, block_index, value);
         return Ok(());
@@ -830,14 +1001,16 @@ fn set_data_block_number(inode_raw: &mut [u8], block_index: usize, value: u32) -
     let single_index = block_index - 12;
     let entries_per_block = (sb.block_size / 4) as usize;
     if single_index >= entries_per_block {
-        return Err(ENOSYS);
+        return Err(EFBIG);
     }
     let mut indirect = get_u32(inode_raw, 40 + 12 * 4);
+    let created_indirect = indirect == 0;
     if indirect == 0 {
         indirect = allocate_block_number()?;
         let zero = [0u8; MAX_BLOCK_SIZE];
         let rc = write_block(indirect, &zero);
         if rc != 0 {
+            let _ = free_block_number(indirect);
             return Err(rc);
         }
         set_inode_block_ptr(inode_raw, 12, indirect);
@@ -848,12 +1021,23 @@ fn set_data_block_number(inode_raw: &mut [u8], block_index: usize, value: u32) -
     }
     let rc = write_indirect_entry(indirect, single_index, value);
     if rc != 0 {
+        if created_indirect {
+            set_inode_block_ptr(inode_raw, 12, 0);
+            set_inode_blocks_512(
+                inode_raw,
+                inode_blocks_512(inode_raw).saturating_sub(sb.block_size / 512),
+            );
+            let _ = free_block_number(indirect);
+        }
         return Err(rc);
     }
     Ok(())
 }
 
 fn ensure_data_block(inode_raw: &mut [u8], block_index: usize) -> Result<u32, i32> {
+    if block_index >= max_writable_blocks() {
+        return Err(EFBIG);
+    }
     let inode = load_inode_from_raw(inode_raw);
     let existing = data_block_number(inode, block_index)?;
     if existing != 0 {
@@ -863,15 +1047,28 @@ fn ensure_data_block(inode_raw: &mut [u8], block_index: usize) -> Result<u32, i3
     let zero = [0u8; MAX_BLOCK_SIZE];
     let rc = write_block(block, &zero);
     if rc != 0 {
+        let _ = free_block_number(block);
         return Err(rc);
     }
-    set_data_block_number(inode_raw, block_index, block)?;
-    let sb = unsafe { STATE.sb };
+    if let Err(rc) = set_data_block_number(inode_raw, block_index, block) {
+        let _ = free_block_number(block);
+        return Err(rc);
+    }
+    let sb = superblock();
     set_inode_blocks_512(
         inode_raw,
         inode_blocks_512(inode_raw) + (sb.block_size / 512),
     );
     Ok(block)
+}
+
+fn max_writable_blocks() -> usize {
+    let sb = superblock();
+    12 + (sb.block_size / 4) as usize
+}
+
+fn max_writable_size() -> u64 {
+    max_writable_blocks() as u64 * superblock().block_size as u64
 }
 
 fn load_inode_from_raw(raw: &[u8]) -> Inode {
@@ -884,6 +1081,7 @@ fn load_inode_from_raw(raw: &[u8]) -> Inode {
     Inode {
         mode: u16::from_le_bytes([raw[0], raw[1]]),
         size: get_u32(raw, 4),
+        flags: get_u32(raw, 32),
         blocks,
     }
 }
@@ -894,8 +1092,12 @@ fn add_dir_entry(
     name: &[u8],
     child_ino: u32,
     file_type: u8,
+    child_is_dir: bool,
 ) -> Result<(), i32> {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
+    if (parent_inode.flags & EXT2_INDEX_FL) != 0 {
+        return Err(ENOSYS);
+    }
     let needed_len = 8 + round_up_4(name.len());
     let mut block_buf = [0u8; MAX_BLOCK_SIZE];
     let blocks = (parent_inode.size as usize).div_ceil(sb.block_size as usize);
@@ -932,6 +1134,17 @@ fn add_dir_entry(
                 if rc != 0 {
                     return Err(rc);
                 }
+                let mut parent_raw = [0u8; MAX_INODE_SIZE];
+                read_inode_raw(parent_ino, &mut parent_raw)?;
+                if child_is_dir {
+                    let links = get_u16(&parent_raw, 26).checked_add(1).ok_or(EOVERFLOW)?;
+                    set_u16(&mut parent_raw, 26, links);
+                }
+                update_change_times(&mut parent_raw);
+                let rc = write_inode_raw(parent_ino, &parent_raw);
+                if rc != 0 {
+                    return Err(rc);
+                }
                 return Ok(());
             }
             off += rec_len;
@@ -961,6 +1174,11 @@ fn add_dir_entry(
     set_u32(&mut parent_raw, 4, parent_inode.size + sb.block_size);
     let blocks_512 = inode_blocks_512(&parent_raw) + (sb.block_size / 512);
     set_inode_blocks_512(&mut parent_raw, blocks_512);
+    if child_is_dir {
+        let links = get_u16(&parent_raw, 26).checked_add(1).ok_or(EOVERFLOW)?;
+        set_u16(&mut parent_raw, 26, links);
+    }
+    update_change_times(&mut parent_raw);
     let rc = write_inode_raw(parent_ino, &parent_raw);
     if rc != 0 {
         return Err(rc);
@@ -969,7 +1187,7 @@ fn add_dir_entry(
 }
 
 fn init_directory_block(block: u32, self_ino: u32, parent_ino: u32) -> i32 {
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     let mut block_buf = [0u8; MAX_BLOCK_SIZE];
     let dot_len = 8 + round_up_4(1);
     block_buf[0..4].copy_from_slice(&self_ino.to_le_bytes());
@@ -988,38 +1206,10 @@ fn init_directory_block(block: u32, self_ino: u32, parent_ino: u32) -> i32 {
     write_block(block, &block_buf)
 }
 
-fn free_inode_blocks(inode_raw: &mut [u8]) -> Result<(), i32> {
-    let sb = unsafe { STATE.sb };
-    let inode = load_inode_from_raw(inode_raw);
-    let mut i = 0usize;
-    while i < 12 {
-        let block = inode.blocks[i];
-        if block != 0 {
-            free_block_number(block)?;
-            set_inode_block_ptr(inode_raw, i, 0);
-        }
-        i += 1;
+extern "C" fn mount_impl(device_id: u32, flags: u32) -> i32 {
+    if (flags & !MCX_FS_MOUNT_READ_ONLY) != 0 {
+        return EINVAL;
     }
-    let indirect = inode.blocks[12];
-    if indirect != 0 {
-        let entries = (sb.block_size / 4) as usize;
-        let mut idx = 0usize;
-        while idx < entries {
-            let block = read_indirect_entry(indirect, idx)?;
-            if block != 0 {
-                free_block_number(block)?;
-            }
-            idx += 1;
-        }
-        free_block_number(indirect)?;
-        set_inode_block_ptr(inode_raw, 12, 0);
-    }
-    set_inode_blocks_512(inode_raw, 0);
-    set_u32(inode_raw, 4, 0);
-    Ok(())
-}
-
-extern "C" fn mount_impl(device_id: u32) -> i32 {
     let Some(_) = (unsafe { STATE.disk_ops.as_ref() }) else {
         return ENOSYS;
     };
@@ -1027,13 +1217,21 @@ extern "C" fn mount_impl(device_id: u32) -> i32 {
         STATE.disk_id = device_id;
     }
     match find_ext2_partition_lba() {
-        Ok((base_lba, sb)) => unsafe {
-            STATE.partition_lba_base = base_lba;
-            STATE.sb = sb;
-            STATE.mounted = true;
-            READY.store(true, Ordering::Release);
-            0
-        },
+        Ok((base_lba, sb)) => {
+            let writable = (flags & MCX_FS_MOUNT_READ_ONLY) == 0;
+            if let Err(rc) = validate_mount_features(sb, writable) {
+                log_bytes(b"ext2.cext: unsupported filesystem features");
+                return rc;
+            }
+            unsafe {
+                STATE.partition_lba_base = base_lba;
+                STATE.sb = sb;
+                STATE.mounted = true;
+                STATE.writable = writable;
+                READY.store(true, Ordering::Release);
+                0
+            }
+        }
         Err(rc) => {
             if rc == EINVAL {
                 log_bytes(b"ext2.cext: mount invalid superblock");
@@ -1056,11 +1254,16 @@ extern "C" fn set_disk_ops_impl(ops: *const McxDiskOps) -> i32 {
 }
 
 extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
     let Some(path) = path_bytes(path) else {
         return EINVAL;
     };
-    if resolve_path(path).is_ok() {
-        return EEXIST;
+    match resolve_path(path) {
+        Ok(_) => return EEXIST,
+        Err(ENOENT) => {}
+        Err(rc) => return rc,
     }
     let (parent_path, name) = match split_parent(path) {
         Ok(v) => v,
@@ -1068,6 +1271,9 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
             return rc;
         }
     };
+    if name.len() > u8::MAX as usize || contains_slash(name) {
+        return EINVAL;
+    }
     let (parent_ino, parent_inode) = match resolve_path(parent_path) {
         Ok(v) => v,
         Err(rc) => {
@@ -1102,6 +1308,10 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
         },
     );
     set_u16(&mut inode_raw, 26, if is_directory { 2 } else { 1 });
+    let now = now_seconds();
+    set_u32(&mut inode_raw, 8, now);
+    set_u32(&mut inode_raw, 12, now);
+    set_u32(&mut inode_raw, 16, now);
     if is_directory {
         let block = match allocate_block_number() {
             Ok(v) => v,
@@ -1116,8 +1326,8 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
             let _ = free_inode_number(ino);
             return rc;
         }
-        set_u32(&mut inode_raw, 4, unsafe { STATE.sb }.block_size);
-        set_u32(&mut inode_raw, 28, unsafe { STATE.sb }.block_size / 512);
+        set_u32(&mut inode_raw, 4, superblock().block_size);
+        set_u32(&mut inode_raw, 28, superblock().block_size / 512);
         set_inode_block_ptr(&mut inode_raw, 0, block);
     } else {
         set_u32(&mut inode_raw, 4, 0);
@@ -1134,7 +1344,20 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
         let _ = free_inode_number(ino);
         return rc;
     }
-    if let Err(err) = add_dir_entry(parent_ino, parent_inode, name, ino, file_type) {
+    if is_directory {
+        if let Err(err) = increment_used_dirs(ino) {
+            let block = get_u32(&inode_raw, 40);
+            if block != 0 {
+                let _ = free_block_number(block);
+            }
+            let _ = free_inode_number(ino);
+            return err;
+        }
+    }
+    if let Err(err) = add_dir_entry(parent_ino, parent_inode, name, ino, file_type, is_directory) {
+        if is_directory {
+            let _ = decrement_used_dirs(ino);
+        }
         if is_directory {
             let block = get_u32(&inode_raw, 40);
             if block != 0 {
@@ -1189,6 +1412,9 @@ extern "C" fn write_impl(
     buf: McxBuffer,
     out_written: *mut usize,
 ) -> i32 {
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
     if buf.ptr.is_null() || out_written.is_null() {
         return EINVAL;
     }
@@ -1202,8 +1428,18 @@ extern "C" fn write_impl(
     if !is_file(inode.mode) {
         return EISDIR;
     }
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     let src = unsafe { core::slice::from_raw_parts(buf.ptr as *const u8, buf.len) };
+    unsafe {
+        *out_written = 0;
+    }
+    let end = match offset.checked_add(src.len() as u64) {
+        Some(value) => value,
+        None => return EFBIG,
+    };
+    if end > max_writable_size() || end > u32::MAX as u64 {
+        return EFBIG;
+    }
     let mut inode_raw = [0u8; MAX_INODE_SIZE];
     if let Err(rc) = read_inode_raw(ino, &mut inode_raw) {
         return rc;
@@ -1215,38 +1451,57 @@ extern "C" fn write_impl(
         let block_index = file_off / sb.block_size as usize;
         let block_off = file_off % sb.block_size as usize;
         let chunk = core::cmp::min(sb.block_size as usize - block_off, src.len() - written);
+        let inode_before = load_inode_from_raw(&inode_raw);
+        let block_existed = match data_block_number(inode_before, block_index) {
+            Ok(value) => value != 0,
+            Err(rc) => return finish_write(out_written, written, rc),
+        };
         let block = match ensure_data_block(&mut inode_raw, block_index) {
             Ok(v) => v,
-            Err(rc) => return rc,
+            Err(rc) => return finish_write(out_written, written, rc),
         };
+        if !block_existed {
+            let rc = write_inode_raw(ino, &inode_raw);
+            if rc != 0 {
+                rollback_new_data_block(
+                    &mut inode_raw,
+                    block_index,
+                    block,
+                    inode_before.blocks[12],
+                );
+                return finish_write(out_written, written, rc);
+            }
+        }
         let mut block_buf = [0u8; MAX_BLOCK_SIZE];
-        let inode_now = load_inode_from_raw(&inode_raw);
-        let existing_block = match data_block_number(inode_now, block_index) {
-            Ok(v) => v,
-            Err(rc) => return rc,
-        };
-        if existing_block != 0 {
+        if block_existed {
             let rc = read_block(block, &mut block_buf);
             if rc != 0 {
-                return rc;
+                return finish_write(out_written, written, rc);
             }
         }
         block_buf[block_off..block_off + chunk].copy_from_slice(&src[written..written + chunk]);
         let rc = write_block(block, &block_buf);
         if rc != 0 {
-            return rc;
+            if !block_existed {
+                rollback_new_data_block(
+                    &mut inode_raw,
+                    block_index,
+                    block,
+                    inode_before.blocks[12],
+                );
+                let _ = write_inode_raw(ino, &inode_raw);
+            }
+            return finish_write(out_written, written, rc);
         }
-        written += chunk;
-    }
-
-    let new_size = core::cmp::max(get_u32(&inode_raw, 4) as u64, offset + written as u64);
-    if new_size > u32::MAX as u64 {
-        return EINVAL;
-    }
-    set_u32(&mut inode_raw, 4, new_size as u32);
-    let rc = write_inode_raw(ino, &inode_raw);
-    if rc != 0 {
-        return rc;
+        let committed = written + chunk;
+        let new_size = core::cmp::max(get_u32(&inode_raw, 4) as u64, offset + committed as u64);
+        set_u32(&mut inode_raw, 4, new_size as u32);
+        update_change_times(&mut inode_raw);
+        let rc = write_inode_raw(ino, &inode_raw);
+        if rc != 0 {
+            return finish_write(out_written, written, rc);
+        }
+        written = committed;
     }
     let rc = disk_flush();
     if rc != 0 {
@@ -1258,7 +1513,50 @@ extern "C" fn write_impl(
     0
 }
 
+fn finish_write(out_written: *mut usize, written: usize, rc: i32) -> i32 {
+    unsafe {
+        *out_written = written;
+    }
+    if written == 0 {
+        rc
+    } else {
+        let _ = disk_flush();
+        0
+    }
+}
+
+fn rollback_new_data_block(
+    inode_raw: &mut [u8],
+    block_index: usize,
+    block: u32,
+    old_indirect: u32,
+) {
+    let sb = superblock();
+    if block_index < 12 {
+        set_inode_block_ptr(inode_raw, block_index, 0);
+    } else {
+        let indirect = get_u32(inode_raw, 40 + 12 * 4);
+        let _ = write_indirect_entry(indirect, block_index - 12, 0);
+        if old_indirect == 0 {
+            set_inode_block_ptr(inode_raw, 12, 0);
+            let _ = free_block_number(indirect);
+            set_inode_blocks_512(
+                inode_raw,
+                inode_blocks_512(inode_raw).saturating_sub(sb.block_size / 512),
+            );
+        }
+    }
+    let _ = free_block_number(block);
+    set_inode_blocks_512(
+        inode_raw,
+        inode_blocks_512(inode_raw).saturating_sub(sb.block_size / 512),
+    );
+}
+
 extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
     let Some(path) = path_bytes(path) else {
         return EINVAL;
     };
@@ -1269,8 +1567,8 @@ extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
     if !is_file(inode.mode) {
         return EISDIR;
     }
-    if len != 0 && len != inode.size as u64 {
-        return ENOSYS;
+    if len > max_writable_size() || len > u32::MAX as u64 {
+        return EFBIG;
     }
     if len == inode.size as u64 {
         return 0;
@@ -1279,13 +1577,109 @@ extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
     if let Err(rc) = read_inode_raw(ino, &mut inode_raw) {
         return rc;
     }
-    if let Err(rc) = free_inode_blocks(&mut inode_raw) {
-        return rc;
+    let old_len = inode.size as u64;
+    if old_len > max_writable_size() {
+        return EFBIG;
     }
+    if len > old_len {
+        set_u32(&mut inode_raw, 4, len as u32);
+        update_change_times(&mut inode_raw);
+        let rc = write_inode_raw(ino, &inode_raw);
+        return if rc == 0 { disk_flush() } else { rc };
+    }
+
+    let sb = superblock();
+    let block_size = sb.block_size as u64;
+    let new_blocks = len.div_ceil(block_size) as usize;
+    let old_blocks = old_len.div_ceil(block_size) as usize;
+
+    if len != 0 && (len % block_size) != 0 {
+        let retained_index = (len / block_size) as usize;
+        let retained = match data_block_number(inode, retained_index) {
+            Ok(value) => value,
+            Err(rc) => return rc,
+        };
+        if retained != 0 {
+            let mut block_buf = [0u8; MAX_BLOCK_SIZE];
+            let rc = read_block(retained, &mut block_buf);
+            if rc != 0 {
+                return rc;
+            }
+            block_buf[len as usize % sb.block_size as usize..sb.block_size as usize].fill(0);
+            let rc = write_block(retained, &block_buf);
+            if rc != 0 {
+                return rc;
+            }
+        }
+    }
+
+    let mut detached = [0u32; MAX_WRITABLE_BLOCKS + 1];
+    let mut detached_count = 0usize;
+    let direct_end = core::cmp::min(old_blocks, 12);
+    let mut index = core::cmp::min(new_blocks, 12);
+    while index < direct_end {
+        let block = get_u32(&inode_raw, 40 + index * 4);
+        if block != 0 {
+            detached[detached_count] = block;
+            detached_count += 1;
+            set_inode_block_ptr(&mut inode_raw, index, 0);
+        }
+        index += 1;
+    }
+
+    let indirect = get_u32(&inode_raw, 40 + 12 * 4);
+    if indirect != 0 {
+        let mut indirect_buf = [0u8; MAX_BLOCK_SIZE];
+        let rc = read_block(indirect, &mut indirect_buf);
+        if rc != 0 {
+            return rc;
+        }
+        let entries = (sb.block_size / 4) as usize;
+        let first = new_blocks.saturating_sub(12).min(entries);
+        let end = old_blocks.saturating_sub(12).min(entries);
+        let mut entry = first;
+        while entry < end {
+            let block = get_u32(&indirect_buf, entry * 4);
+            if block != 0 {
+                detached[detached_count] = block;
+                detached_count += 1;
+                set_u32(&mut indirect_buf, entry * 4, 0);
+            }
+            entry += 1;
+        }
+        if new_blocks <= 12 {
+            set_inode_block_ptr(&mut inode_raw, 12, 0);
+            detached[detached_count] = indirect;
+            detached_count += 1;
+        } else {
+            let rc = write_block(indirect, &indirect_buf);
+            if rc != 0 {
+                return rc;
+            }
+        }
+    }
+
+    let sectors_per_block = sb.block_size / 512;
+    let removed_sectors = (detached_count as u32).saturating_mul(sectors_per_block);
+    let remaining_sectors = inode_blocks_512(&inode_raw).saturating_sub(removed_sectors);
+    set_inode_blocks_512(&mut inode_raw, remaining_sectors);
+    set_u32(&mut inode_raw, 4, len as u32);
+    update_change_times(&mut inode_raw);
     let rc = write_inode_raw(ino, &inode_raw);
     if rc != 0 {
         return rc;
     }
+    let mut free_index = 0usize;
+    while free_index < detached_count {
+        if let Err(rc) = free_block_number(detached[free_index]) {
+            return rc;
+        }
+        free_index += 1;
+    }
+    disk_flush()
+}
+
+extern "C" fn sync_impl() -> i32 {
     disk_flush()
 }
 
@@ -1323,7 +1717,7 @@ extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -
     if !is_dir(inode.mode) {
         return ENOTDIR;
     }
-    let sb = unsafe { STATE.sb };
+    let sb = superblock();
     let dst = unsafe { core::slice::from_raw_parts_mut(buf.ptr, buf.len) };
     let mut written = 0usize;
     let mut block_buf = [0u8; MAX_BLOCK_SIZE];
@@ -1391,6 +1785,7 @@ static OPS: McxFsOps = McxFsOps {
     truncate: truncate_impl,
     stat: stat_impl,
     readdir: readdir_impl,
+    sync: sync_impl,
 };
 
 #[unsafe(no_mangle)]

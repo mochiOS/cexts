@@ -2,7 +2,7 @@
 id = "org.mochios.cexts.ext2"
 name = "ext2"
 version = 1
-abi = 1
+abi = 2
 entry = "entry"
 
 [load]
