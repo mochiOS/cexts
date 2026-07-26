@@ -20,6 +20,7 @@ const PCI_COMMAND_IO: u16 = 1 << 0;
 const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
 
 const VIRTIO_PCI_GUEST_FEATURES: u16 = 0x04;
+const VIRTIO_PCI_HOST_FEATURES: u16 = 0x00;
 const VIRTIO_PCI_QUEUE_PFN: u16 = 0x08;
 const VIRTIO_PCI_QUEUE_NUM: u16 = 0x0c;
 const VIRTIO_PCI_QUEUE_SEL: u16 = 0x0e;
@@ -37,6 +38,7 @@ const VIRTIO_STATUS_FAILED: u8 = 128;
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
 const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_F_FLUSH: u32 = 1 << 9;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 const SECTOR_SIZE: usize = 512;
@@ -88,6 +90,7 @@ struct DriverState {
 }
 
 static READY: AtomicBool = AtomicBool::new(false);
+static FLUSH_SUPPORTED: AtomicBool = AtomicBool::new(false);
 static IRQ_REGISTERED: AtomicBool = AtomicBool::new(false);
 static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static IRQ_LINE: AtomicU8 = AtomicU8::new(0xff);
@@ -276,7 +279,10 @@ unsafe fn setup_device(api: *const McxKernelApi) -> i32 {
         VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
     );
     outl(io_base + VIRTIO_PCI_GUEST_PAGE_SIZE, 4096);
-    outl(io_base + VIRTIO_PCI_GUEST_FEATURES, 0);
+    let host_features = inl(io_base + VIRTIO_PCI_HOST_FEATURES);
+    let guest_features = host_features & VIRTIO_BLK_F_FLUSH;
+    outl(io_base + VIRTIO_PCI_GUEST_FEATURES, guest_features);
+    FLUSH_SUPPORTED.store(guest_features & VIRTIO_BLK_F_FLUSH != 0, Ordering::Release);
     outw(io_base + VIRTIO_PCI_QUEUE_SEL, 0);
     let queue_num = inw(io_base + VIRTIO_PCI_QUEUE_NUM);
     if queue_num < 3 {
@@ -647,6 +653,9 @@ extern "C" fn flush_impl(disk_id: u32) -> i32 {
     }
     if disk_id != DISK_ID {
         return EINVAL;
+    }
+    if !FLUSH_SUPPORTED.load(Ordering::Acquire) {
+        return 0;
     }
     unsafe { submit_request(0, core::ptr::null_mut(), 0, false, true) }
 }
