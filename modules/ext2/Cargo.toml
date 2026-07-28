@@ -9,4 +9,4 @@ crate-type = ["staticlib"]
 path = "src/lib.rs"
 
 [dependencies]
-mochi-cext-abi = { path = "../../crates/cext-abi" }
+mochi-cext-abi = { git = "https://github.com/mochiOS/cexts", package = "mochi-cext-abi" }
