@@ -28,6 +28,7 @@ const EXT2_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 const EXT2_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
 const MAX_WRITABLE_BLOCKS: usize = 12 + MAX_BLOCK_SIZE / 4;
+const ENOTEMPTY: i32 = -39;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1122,6 +1123,21 @@ fn add_dir_entry(
             if rec_len == 0 || off + rec_len > sb.block_size as usize {
                 break;
             }
+            let entry_ino = get_u32(&block_buf, off);
+            if entry_ino == 0 && rec_len >= needed_len {
+                block_buf[off..off + rec_len].fill(0);
+                set_u32(&mut block_buf, off, child_ino);
+                set_u16(&mut block_buf, off + 4, rec_len as u16);
+                block_buf[off + 6] = name.len() as u8;
+                block_buf[off + 7] = file_type;
+                block_buf[off + 8..off + 8 + name.len()].copy_from_slice(name);
+                let rc = write_block(block, &block_buf);
+                if rc != 0 {
+                    return Err(rc);
+                }
+                update_parent_after_entry_change(parent_ino, child_is_dir, true)?;
+                return Ok(());
+            }
             let ideal = 8 + round_up_4(name_len);
             if rec_len >= ideal + needed_len {
                 let remaining = rec_len - ideal;
@@ -1185,6 +1201,227 @@ fn add_dir_entry(
     let rc = write_inode_raw(parent_ino, &parent_raw);
     if rc != 0 {
         return Err(rc);
+    }
+    Ok(())
+}
+
+fn update_parent_after_entry_change(
+    parent_ino: u32,
+    child_is_dir: bool,
+    added: bool,
+) -> Result<(), i32> {
+    let mut parent_raw = [0u8; MAX_INODE_SIZE];
+    read_inode_raw(parent_ino, &mut parent_raw)?;
+    if child_is_dir {
+        let links = get_u16(&parent_raw, 26);
+        let links = if added {
+            links.checked_add(1).ok_or(EOVERFLOW)?
+        } else {
+            links.checked_sub(1).ok_or(EINVAL)?
+        };
+        set_u16(&mut parent_raw, 26, links);
+    }
+    update_change_times(&mut parent_raw);
+    let rc = write_inode_raw(parent_ino, &parent_raw);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(rc)
+    }
+}
+
+fn remove_dir_entry(
+    parent_ino: u32,
+    parent_inode: Inode,
+    name: &[u8],
+    child_ino: u32,
+    child_is_dir: bool,
+) -> Result<(), i32> {
+    let sb = superblock();
+    if (parent_inode.flags & EXT2_INDEX_FL) != 0 {
+        return Err(ENOSYS);
+    }
+    let blocks = (parent_inode.size as usize).div_ceil(sb.block_size as usize);
+    let mut block_buf = [0u8; MAX_BLOCK_SIZE];
+    let mut block_index = 0usize;
+    while block_index < blocks {
+        let block = data_block_number(parent_inode, block_index)?;
+        if block == 0 {
+            block_index += 1;
+            continue;
+        }
+        let rc = read_block(block, &mut block_buf);
+        if rc != 0 {
+            return Err(rc);
+        }
+        let mut off = 0usize;
+        let mut previous = None;
+        while off + 8 <= sb.block_size as usize {
+            let entry_ino = get_u32(&block_buf, off);
+            let rec_len = get_u16(&block_buf, off + 4) as usize;
+            let name_len = block_buf[off + 6] as usize;
+            if rec_len == 0 || off + rec_len > sb.block_size as usize {
+                break;
+            }
+            if entry_ino == child_ino
+                && off + 8 + name_len <= sb.block_size as usize
+                && &block_buf[off + 8..off + 8 + name_len] == name
+            {
+                if let Some(previous_off) = previous {
+                    let previous_len = get_u16(&block_buf, previous_off + 4) as usize;
+                    let merged = previous_len.checked_add(rec_len).ok_or(EOVERFLOW)?;
+                    set_u16(&mut block_buf, previous_off + 4, merged as u16);
+                } else {
+                    set_u32(&mut block_buf, off, 0);
+                }
+                let rc = write_block(block, &block_buf);
+                if rc != 0 {
+                    return Err(rc);
+                }
+                update_parent_after_entry_change(parent_ino, child_is_dir, false)?;
+                return Ok(());
+            }
+            if entry_ino != 0 {
+                previous = Some(off);
+            }
+            off += rec_len;
+        }
+        block_index += 1;
+    }
+    Err(ENOENT)
+}
+
+fn rename_dir_entry(
+    parent_ino: u32,
+    parent_inode: Inode,
+    old_name: &[u8],
+    new_name: &[u8],
+    child_ino: u32,
+    file_type: u8,
+) -> Result<(), i32> {
+    let sb = superblock();
+    let blocks = (parent_inode.size as usize).div_ceil(sb.block_size as usize);
+    let mut block_buf = [0u8; MAX_BLOCK_SIZE];
+    let mut block_index = 0usize;
+    while block_index < blocks {
+        let block = data_block_number(parent_inode, block_index)?;
+        if block == 0 {
+            block_index += 1;
+            continue;
+        }
+        let rc = read_block(block, &mut block_buf);
+        if rc != 0 {
+            return Err(rc);
+        }
+        let mut off = 0usize;
+        while off + 8 <= sb.block_size as usize {
+            let entry_ino = get_u32(&block_buf, off);
+            let rec_len = get_u16(&block_buf, off + 4) as usize;
+            let name_len = block_buf[off + 6] as usize;
+            if rec_len == 0 || off + rec_len > sb.block_size as usize {
+                break;
+            }
+            if entry_ino == child_ino
+                && off + 8 + name_len <= sb.block_size as usize
+                && &block_buf[off + 8..off + 8 + name_len] == old_name
+                && new_name.len() <= rec_len.saturating_sub(8)
+            {
+                block_buf[off + 6] = new_name.len() as u8;
+                block_buf[off + 7] = file_type;
+                block_buf[off + 8..off + rec_len].fill(0);
+                block_buf[off + 8..off + 8 + new_name.len()].copy_from_slice(new_name);
+                let rc = write_block(block, &block_buf);
+                if rc != 0 {
+                    return Err(rc);
+                }
+                update_parent_after_entry_change(parent_ino, false, true)?;
+                return Ok(());
+            }
+            off += rec_len;
+        }
+        block_index += 1;
+    }
+
+    add_dir_entry(
+        parent_ino,
+        parent_inode,
+        new_name,
+        child_ino,
+        file_type,
+        false,
+    )?;
+    remove_dir_entry(
+        parent_ino,
+        load_inode(parent_ino)?,
+        old_name,
+        child_ino,
+        false,
+    )
+}
+
+fn directory_is_empty(inode: Inode) -> Result<bool, i32> {
+    let sb = superblock();
+    let blocks = (inode.size as usize).div_ceil(sb.block_size as usize);
+    let mut block_buf = [0u8; MAX_BLOCK_SIZE];
+    let mut block_index = 0usize;
+    while block_index < blocks {
+        let block = data_block_number(inode, block_index)?;
+        if block == 0 {
+            block_index += 1;
+            continue;
+        }
+        let rc = read_block(block, &mut block_buf);
+        if rc != 0 {
+            return Err(rc);
+        }
+        let mut off = 0usize;
+        while off + 8 <= sb.block_size as usize {
+            let entry_ino = get_u32(&block_buf, off);
+            let rec_len = get_u16(&block_buf, off + 4) as usize;
+            let name_len = block_buf[off + 6] as usize;
+            if rec_len == 0 || off + rec_len > sb.block_size as usize {
+                break;
+            }
+            if entry_ino != 0 && off + 8 + name_len <= sb.block_size as usize {
+                let name = &block_buf[off + 8..off + 8 + name_len];
+                if name != b"." && name != b".." {
+                    return Ok(false);
+                }
+            }
+            off += rec_len;
+        }
+        block_index += 1;
+    }
+    Ok(true)
+}
+
+fn free_inode_blocks(inode: Inode) -> Result<(), i32> {
+    if inode.blocks[13] != 0 || inode.blocks[14] != 0 {
+        return Err(ENOSYS);
+    }
+    let sb = superblock();
+    let mut index = 0usize;
+    while index < 12 {
+        if inode.blocks[index] != 0 {
+            free_block_number(inode.blocks[index])?;
+        }
+        index += 1;
+    }
+    if inode.blocks[12] != 0 {
+        let mut indirect = [0u8; MAX_BLOCK_SIZE];
+        let rc = read_block(inode.blocks[12], &mut indirect);
+        if rc != 0 {
+            return Err(rc);
+        }
+        let mut entry = 0usize;
+        while entry < (sb.block_size / 4) as usize {
+            let block = get_u32(&indirect, entry * 4);
+            if block != 0 {
+                free_block_number(block)?;
+            }
+            entry += 1;
+        }
+        free_block_number(inode.blocks[12])?;
     }
     Ok(())
 }
@@ -1380,12 +1617,137 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
     0
 }
 
-extern "C" fn remove_impl(_path: McxPath, _is_dir: u32) -> i32 {
-    ENOSYS
+extern "C" fn remove_impl(path: McxPath, remove_directory: u32) -> i32 {
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
+    let Some(path) = path_bytes(path) else {
+        return EINVAL;
+    };
+    if path == b"/" || remove_directory > 1 {
+        return EINVAL;
+    }
+    let (ino, inode) = match resolve_path(path) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    let target_is_dir = is_dir(inode.mode);
+    if !target_is_dir && !is_file(inode.mode) {
+        return ENOSYS;
+    }
+    if target_is_dir != (remove_directory != 0) {
+        return if target_is_dir { EISDIR } else { ENOTDIR };
+    }
+    if inode.blocks[13] != 0 || inode.blocks[14] != 0 {
+        return ENOSYS;
+    }
+    if target_is_dir {
+        match directory_is_empty(inode) {
+            Ok(true) => {}
+            Ok(false) => return ENOTEMPTY,
+            Err(rc) => return rc,
+        }
+    }
+    let (parent_path, name) = match split_parent(path) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    let (parent_ino, parent_inode) = match resolve_path(parent_path) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    if let Err(rc) = remove_dir_entry(parent_ino, parent_inode, name, ino, target_is_dir) {
+        return rc;
+    }
+    if let Err(rc) = free_inode_blocks(inode) {
+        return rc;
+    }
+    let mut inode_raw = [0u8; MAX_INODE_SIZE];
+    if let Err(rc) = read_inode_raw(ino, &mut inode_raw) {
+        return rc;
+    }
+    inode_raw.fill(0);
+    set_u32(&mut inode_raw, 20, now_seconds());
+    let rc = write_inode_raw(ino, &inode_raw);
+    if rc != 0 {
+        return rc;
+    }
+    if target_is_dir {
+        if let Err(rc) = decrement_used_dirs(ino) {
+            return rc;
+        }
+    }
+    if let Err(rc) = free_inode_number(ino) {
+        return rc;
+    }
+    disk_flush()
 }
 
-extern "C" fn rename_impl(_src: McxPath, _dst: McxPath) -> i32 {
-    ENOSYS
+extern "C" fn rename_impl(src: McxPath, dst: McxPath) -> i32 {
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
+    let (Some(src), Some(dst)) = (path_bytes(src), path_bytes(dst)) else {
+        return EINVAL;
+    };
+    if src == b"/" || dst == b"/" || src == dst {
+        return if src == dst { 0 } else { EINVAL };
+    }
+    match resolve_path(dst) {
+        Ok(_) => return EEXIST,
+        Err(ENOENT) => {}
+        Err(rc) => return rc,
+    }
+    let (src_parent_path, src_name) = match split_parent(src) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    let (dst_parent_path, dst_name) = match split_parent(dst) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    if src_parent_path != dst_parent_path
+        || dst_name.len() > u8::MAX as usize
+        || contains_slash(dst_name)
+    {
+        return EINVAL;
+    }
+    let (child_ino, child_inode) = match resolve_path(src) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    if !is_dir(child_inode.mode) && !is_file(child_inode.mode) {
+        return ENOSYS;
+    }
+    let (parent_ino, parent_inode) = match resolve_path(src_parent_path) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    let file_type = if is_dir(child_inode.mode) {
+        EXT2_FT_DIR
+    } else {
+        EXT2_FT_REG_FILE
+    };
+    if let Err(rc) = rename_dir_entry(
+        parent_ino,
+        parent_inode,
+        src_name,
+        dst_name,
+        child_ino,
+        file_type,
+    ) {
+        return rc;
+    }
+    let mut child_raw = [0u8; MAX_INODE_SIZE];
+    if let Err(rc) = read_inode_raw(child_ino, &mut child_raw) {
+        return rc;
+    }
+    update_change_times(&mut child_raw);
+    let rc = write_inode_raw(child_ino, &child_raw);
+    if rc != 0 {
+        return rc;
+    }
+    disk_flush()
 }
 
 extern "C" fn read_impl(path: McxPath, offset: u64, buf: McxBuffer, out_read: *mut usize) -> i32 {
