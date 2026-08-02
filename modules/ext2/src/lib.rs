@@ -58,6 +58,8 @@ struct GroupDesc {
 #[derive(Clone, Copy)]
 struct Inode {
     mode: u16,
+    uid: u32,
+    gid: u32,
     size: u32,
     flags: u32,
     blocks: [u32; 15],
@@ -1084,6 +1086,8 @@ fn load_inode_from_raw(raw: &[u8]) -> Inode {
     }
     Inode {
         mode: u16::from_le_bytes([raw[0], raw[1]]),
+        uid: get_u16(raw, 2) as u32 | ((get_u16(raw, 120) as u32) << 16),
+        gid: get_u16(raw, 24) as u32 | ((get_u16(raw, 122) as u32) << 16),
         size: get_u32(raw, 4),
         flags: get_u32(raw, 32),
         blocks,
@@ -1223,11 +1227,7 @@ fn update_parent_after_entry_change(
     }
     update_change_times(&mut parent_raw);
     let rc = write_inode_raw(parent_ino, &parent_raw);
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
 fn remove_dir_entry(
@@ -1493,7 +1493,7 @@ extern "C" fn set_disk_ops_impl(ops: *const McxDiskOps) -> i32 {
     0
 }
 
-extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
+extern "C" fn create_impl(path: McxPath, mode: u32, uid: u32, gid: u32) -> i32 {
     if let Err(rc) = require_writable() {
         return rc;
     }
@@ -1547,6 +1547,14 @@ extern "C" fn create_impl(path: McxPath, mode: u32) -> i32 {
             S_IFREG | ((mode as u16) & 0o777)
         },
     );
+    if uid != u32::MAX {
+        set_u16(&mut inode_raw, 2, uid as u16);
+        set_u16(&mut inode_raw, 120, (uid >> 16) as u16);
+    }
+    if gid != u32::MAX {
+        set_u16(&mut inode_raw, 24, gid as u16);
+        set_u16(&mut inode_raw, 122, (gid >> 16) as u16);
+    }
     set_u16(&mut inode_raw, 26, if is_directory { 2 } else { 1 });
     let now = now_seconds();
     set_u32(&mut inode_raw, 8, now);
@@ -1892,11 +1900,7 @@ fn finish_write(out_written: *mut usize, written: usize, rc: i32) -> i32 {
     unsafe {
         *out_written = written;
     }
-    if written == 0 {
-        rc
-    } else {
-        disk_flush()
-    }
+    if written == 0 { rc } else { disk_flush() }
 }
 
 fn rollback_new_data_block(
@@ -2086,8 +2090,14 @@ extern "C" fn sync_impl() -> i32 {
     disk_flush()
 }
 
-extern "C" fn stat_impl(path: McxPath, out_mode: *mut u16, out_size: *mut u64) -> i32 {
-    if out_mode.is_null() || out_size.is_null() {
+extern "C" fn stat_impl(
+    path: McxPath,
+    out_mode: *mut u16,
+    out_size: *mut u64,
+    out_uid: *mut u32,
+    out_gid: *mut u32,
+) -> i32 {
+    if out_mode.is_null() || out_size.is_null() || out_uid.is_null() || out_gid.is_null() {
         return EINVAL;
     }
     let Some(path) = path_bytes(path) else {
@@ -2101,8 +2111,58 @@ extern "C" fn stat_impl(path: McxPath, out_mode: *mut u16, out_size: *mut u64) -
     unsafe {
         *out_mode = inode.mode;
         *out_size = inode.size as u64;
+        *out_uid = inode.uid;
+        *out_gid = inode.gid;
     }
     0
+}
+
+extern "C" fn chmod_impl(path: McxPath, mode: u32) -> i32 {
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
+    let Some(path) = path_bytes(path) else {
+        return EINVAL;
+    };
+    let (ino, _) = match resolve_path(path) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    let mut inode_raw = [0u8; MAX_INODE_SIZE];
+    if let Err(rc) = read_inode_raw(ino, &mut inode_raw) {
+        return rc;
+    }
+    let file_type = get_u16(&inode_raw, 0) & 0xf000;
+    set_u16(&mut inode_raw, 0, file_type | ((mode as u16) & 0o7777));
+    update_change_times(&mut inode_raw);
+    write_inode_raw(ino, &inode_raw)
+}
+
+extern "C" fn chown_impl(path: McxPath, uid: u32, gid: u32) -> i32 {
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
+    let Some(path) = path_bytes(path) else {
+        return EINVAL;
+    };
+    let (ino, _) = match resolve_path(path) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    let mut inode_raw = [0u8; MAX_INODE_SIZE];
+    if let Err(rc) = read_inode_raw(ino, &mut inode_raw) {
+        return rc;
+    }
+    if uid != u32::MAX {
+        set_u16(&mut inode_raw, 2, uid as u16);
+        set_u16(&mut inode_raw, 120, (uid >> 16) as u16);
+    }
+    if gid != u32::MAX {
+        set_u16(&mut inode_raw, 24, gid as u16);
+        set_u16(&mut inode_raw, 122, (gid >> 16) as u16);
+    }
+    update_change_times(&mut inode_raw);
+    write_inode_raw(ino, &inode_raw)
 }
 
 extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -> i32 {
@@ -2187,6 +2247,8 @@ static OPS: McxFsOps = McxFsOps {
     write: write_impl,
     truncate: truncate_impl,
     stat: stat_impl,
+    chmod: chmod_impl,
+    chown: chown_impl,
     readdir: readdir_impl,
     sync: sync_impl,
 };
@@ -2315,5 +2377,19 @@ mod tests {
     fn read_only_mount_rejects_mutation() {
         assert_eq!(validate_write_access(false), Err(EROFS));
         assert_eq!(validate_write_access(true), Ok(()));
+    }
+
+    #[test]
+    fn inode_owner_uses_low_and_high_uid_gid_fields() {
+        let mut raw = [0u8; MAX_INODE_SIZE];
+        set_u16(&mut raw, 0, S_IFREG | 0o640);
+        set_u16(&mut raw, 2, 0x5678);
+        set_u16(&mut raw, 24, 0xdef0);
+        set_u16(&mut raw, 120, 0x1234);
+        set_u16(&mut raw, 122, 0x9abc);
+        let inode = load_inode_from_raw(&raw);
+        assert_eq!(inode.uid, 0x1234_5678);
+        assert_eq!(inode.gid, 0x9abc_def0);
+        assert_eq!(inode.mode, S_IFREG | 0o640);
     }
 }
