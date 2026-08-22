@@ -43,6 +43,7 @@ const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 const SECTOR_SIZE: usize = 512;
 const MAX_TRANSFER_BYTES: usize = 256 * 1024;
+const REQUEST_TIMEOUT_SECONDS: u32 = 30;
 const QUEUE_ALIGN: usize = 4096;
 const DISK_ID: u32 = 0;
 const PCI_INTERRUPT_LINE_OFFSET: u8 = 0x3c;
@@ -424,25 +425,10 @@ extern "C" fn virtio_irq_handler(_irq: u8) {
 }
 
 unsafe fn wait_for_completion(io_base: u16, used_before: u16, expect_head: u32) -> i32 {
-    if IRQ_REGISTERED.load(Ordering::Acquire) {
-        let mut spins = 0u32;
-        while !IRQ_PENDING.load(Ordering::Acquire)
-            && read_volatile(core::ptr::addr_of!((*used_ptr()).idx)) == used_before
-        {
-            core::hint::spin_loop();
-            spins = spins.wrapping_add(1);
-            if spins == 100_000_000 {
-                break;
-            }
-        }
-        IRQ_PENDING.store(false, Ordering::Release);
-    }
-
-    let mut spins = 0u32;
+    let started_at = ((*STATE.api).now_seconds)();
     while read_volatile(core::ptr::addr_of!((*used_ptr()).idx)) == used_before {
         core::hint::spin_loop();
-        spins = spins.wrapping_add(1);
-        if spins == 100_000_000 {
+        if ((*STATE.api).now_seconds)().wrapping_sub(started_at) >= REQUEST_TIMEOUT_SECONDS {
             log_u8(b"disk.cext: irq_line=", IRQ_LINE.load(Ordering::Acquire));
             log_u16(
                 b"disk.cext: used.idx=",
@@ -453,6 +439,7 @@ unsafe fn wait_for_completion(io_base: u16, used_before: u16, expect_head: u32) 
             return EIO;
         }
     }
+    IRQ_PENDING.store(false, Ordering::Release);
     fence(Ordering::SeqCst);
     let _ = inb(io_base + VIRTIO_PCI_ISR);
     let used_slot = (used_before % STATE.queue_size) as usize;
