@@ -7,20 +7,15 @@ name = "mochi-cext-abi"
 version = "0.1.0"
 
 [[package]]
-name = "mochi-cext-abi"
-version = "0.1.0"
-source = "git+https://github.com/mochiOS/cexts#c6113c54e255b777b7743a36c4fe768760fa37ca"
-
-[[package]]
 name = "mochi-disk-cext"
 version = "0.1.0"
 dependencies = [
- "mochi-cext-abi 0.1.0 (git+https://github.com/mochiOS/cexts)",
+ "mochi-cext-abi",
 ]
 
 [[package]]
 name = "mochi-ext2-cext"
 version = "0.1.0"
 dependencies = [
- "mochi-cext-abi 0.1.0 (git+https://github.com/mochiOS/cexts)",
+ "mochi-cext-abi",
 ]
