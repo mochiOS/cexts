@@ -2910,7 +2910,7 @@ pub extern "C" fn panic_const_div_by_zero() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mochi_module_init(api: *const McxKernelApi) -> *const McxFsOps {
+pub extern "C" fn mnu_module_init(api: *const McxKernelApi) -> *const McxFsOps {
     if api.is_null() {
         return core::ptr::null();
     }

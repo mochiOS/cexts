@@ -655,7 +655,7 @@ static OPS: McxDiskOps = McxDiskOps {
 };
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mochi_module_init(api: *const McxKernelApi) -> *const McxDiskOps {
+pub extern "C" fn mnu_module_init(api: *const McxKernelApi) -> *const McxDiskOps {
     if api.is_null() {
         return core::ptr::null();
     }
