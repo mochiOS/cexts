@@ -19,6 +19,10 @@ const SYSTEM_PARTITION_TYPE: [u8; 16] = [
     0x68, 0x63, 0x6f, 0x6d, 0x4f, 0x69, 0x00, 0x53,
     0x80, 0x00, 0x6d, 0x50, 0x61, 0x72, 0x74, 0x01,
 ];
+const DATA_PARTITION_TYPE: [u8; 16] = [
+    0x68, 0x63, 0x6f, 0x6d, 0x4f, 0x69, 0x00, 0x53,
+    0x80, 0x00, 0x6d, 0x50, 0x61, 0x72, 0x74, 0x02,
+];
 const ROOT_INO: u32 = 2;
 const S_IFDIR: u16 = 0x4000;
 const S_IFREG: u16 = 0x8000;
@@ -80,9 +84,20 @@ struct State {
     partition_lba_base: u64,
     partition_lba_count: u64,
     sb: Superblock,
+    system_volume: Option<Volume>,
+    data_volume: Option<Volume>,
+}
+
+#[derive(Clone, Copy)]
+struct Volume {
+    base: u64,
+    count: u64,
+    sb: Superblock,
+    writable: bool,
 }
 
 static READY: AtomicBool = AtomicBool::new(false);
+static OPERATION_LOCK: AtomicBool = AtomicBool::new(false);
 static mut STATE: State = State {
     disk_ops: core::ptr::null(),
     mounted: false,
@@ -104,6 +119,8 @@ static mut STATE: State = State {
         feature_ro_compat: 0,
     },
     writable: false,
+    system_volume: None,
+    data_volume: None,
 };
 static mut KERNEL_API: *const McxKernelApi = core::ptr::null();
 
@@ -496,7 +513,20 @@ fn is_system_slot_entry(entry: &[u8], slot: u32) -> bool {
     entry[56 + name.len() * 2] == 0 && entry[57 + name.len() * 2] == 0
 }
 
-fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
+fn is_data_entry(entry: &[u8]) -> bool {
+    if entry.len() < 128 || entry[..16] != DATA_PARTITION_TYPE {
+        return false;
+    }
+    let name = b"mochiOS Data";
+    for (index, byte) in name.iter().enumerate() {
+        if entry[56 + index * 2] != *byte || entry[57 + index * 2] != 0 {
+            return false;
+        }
+    }
+    entry[56 + name.len() * 2] == 0 && entry[57 + name.len() * 2] == 0
+}
+
+fn find_ext2_partition_lba() -> Result<(Volume, Option<Volume>), i32> {
     let slot = unsafe {
         KERNEL_API.as_ref().map(|api| (api.boot_system_slot)())
     }.ok_or(ENOSYS)?;
@@ -505,7 +535,7 @@ fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
     }
     if slot == 0 {
         match try_mount_at_lba(0, 0) {
-            Ok(sb) => return Ok((0, sb)),
+            Ok(sb) => return Ok((Volume { base: 0, count: 0, sb, writable: true }, None)),
             Err(rc) if rc != EINVAL => return Err(rc),
             Err(_) => {}
         }
@@ -535,6 +565,7 @@ fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
         return Err(EINVAL);
     }
     let mut selected_partition = None;
+    let mut data_partition = None;
     let mut index = 0u32;
     while index < max_entries {
         let offset = entries_lba
@@ -566,12 +597,16 @@ fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
             if first_lba != 0 {
                 if slot == 0 {
                     match try_mount_at_lba(first_lba, lba_count) {
-                        Ok(sb) => return Ok((first_lba, sb)),
+                        Ok(sb) => return Ok((Volume { base: first_lba, count: lba_count, sb, writable: true }, None)),
                         Err(rc) if rc != EINVAL => return Err(rc),
                         Err(_) => {}
                     }
                 } else if is_system_slot_entry(&entry[..entry_size as usize], slot) {
                     if selected_partition.replace((first_lba, lba_count)).is_some() {
+                        return Err(EINVAL);
+                    }
+                } else if is_data_entry(&entry[..entry_size as usize]) {
+                    if data_partition.replace((first_lba, lba_count)).is_some() {
                         return Err(EINVAL);
                     }
                 }
@@ -580,8 +615,20 @@ fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
         index += 1;
     }
 
-    if let Some((lba, count)) = selected_partition {
-        return try_mount_at_lba(lba, count).map(|sb| (lba, sb));
+    if let (Some((lba, count)), Some((data_lba, data_count))) =
+        (selected_partition, data_partition)
+    {
+        let system_end = lba.checked_add(count).ok_or(EINVAL)?;
+        let data_end = data_lba.checked_add(data_count).ok_or(EINVAL)?;
+        if lba < data_end && data_lba < system_end {
+            return Err(EINVAL);
+        }
+        let sb = try_mount_at_lba(lba, count)?;
+        let data_sb = try_mount_at_lba(data_lba, data_count)?;
+        return Ok((
+            Volume { base: lba, count, sb, writable: true },
+            Some(Volume { base: data_lba, count: data_count, sb: data_sb, writable: true }),
+        ));
     }
     Err(EINVAL)
 }
@@ -1989,17 +2036,29 @@ extern "C" fn mount_impl(device_id: u32, flags: u32) -> i32 {
         STATE.disk_id = device_id;
     }
     match find_ext2_partition_lba() {
-        Ok((base_lba, sb)) => {
+        Ok((mut system, mut data)) => {
             let writable = (flags & MCX_FS_MOUNT_READ_ONLY) == 0;
-            if let Err(rc) = validate_mount_features(sb, writable) {
+            let ab_layout = data.is_some();
+            if let Err(rc) = validate_mount_features(system.sb, writable && !ab_layout) {
                 log_bytes(b"ext2.cext: unsupported filesystem features");
                 return rc;
             }
+            if let Some(volume) = data {
+                if let Err(rc) = validate_mount_features(volume.sb, writable) {
+                    log_bytes(b"ext2.cext: unsupported data filesystem features");
+                    return rc;
+                }
+            }
+            system.writable = writable && !ab_layout;
+            if let Some(ref mut volume) = data { volume.writable = writable; }
             unsafe {
-                STATE.partition_lba_base = base_lba;
-                STATE.sb = sb;
+                STATE.partition_lba_base = system.base;
+                STATE.partition_lba_count = system.count;
+                STATE.sb = system.sb;
                 STATE.mounted = true;
-                STATE.writable = writable;
+                STATE.writable = system.writable;
+                STATE.system_volume = Some(system);
+                STATE.data_volume = data;
                 READY.store(true, Ordering::Release);
             }
             let slot = unsafe { KERNEL_API.as_ref().map(|api| (api.boot_system_slot)()) };
@@ -2008,6 +2067,7 @@ extern "C" fn mount_impl(device_id: u32, flags: u32) -> i32 {
                 Some(2) => log_boot_bytes(b"ext2.cext: mounted system B"),
                 _ => {}
             }
+            if data.is_some() { log_boot_bytes(b"ext2.cext: mounted data"); }
             0
         }
         Err(rc) => {
@@ -2031,7 +2091,7 @@ extern "C" fn set_disk_ops_impl(ops: *const McxDiskOps) -> i32 {
     0
 }
 
-extern "C" fn create_impl(path: McxPath, mode: u32, uid: u32, gid: u32) -> i32 {
+extern "C" fn create_raw(path: McxPath, mode: u32, uid: u32, gid: u32) -> i32 {
     if let Err(rc) = require_writable() {
         return rc;
     }
@@ -2163,7 +2223,7 @@ extern "C" fn create_impl(path: McxPath, mode: u32, uid: u32, gid: u32) -> i32 {
     0
 }
 
-extern "C" fn remove_impl(path: McxPath, remove_directory: u32) -> i32 {
+extern "C" fn remove_raw(path: McxPath, remove_directory: u32) -> i32 {
     if let Err(rc) = require_writable() {
         return rc;
     }
@@ -2229,7 +2289,7 @@ extern "C" fn remove_impl(path: McxPath, remove_directory: u32) -> i32 {
     disk_flush()
 }
 
-extern "C" fn rename_impl(src: McxPath, dst: McxPath) -> i32 {
+extern "C" fn rename_raw(src: McxPath, dst: McxPath) -> i32 {
     if let Err(rc) = require_writable() {
         return rc;
     }
@@ -2296,7 +2356,7 @@ extern "C" fn rename_impl(src: McxPath, dst: McxPath) -> i32 {
     disk_flush()
 }
 
-extern "C" fn read_impl(path: McxPath, offset: u64, buf: McxBuffer, out_read: *mut usize) -> i32 {
+extern "C" fn read_raw(path: McxPath, offset: u64, buf: McxBuffer, out_read: *mut usize) -> i32 {
     if buf.ptr.is_null() || out_read.is_null() {
         return EINVAL;
     }
@@ -2317,7 +2377,7 @@ extern "C" fn read_impl(path: McxPath, offset: u64, buf: McxBuffer, out_read: *m
     }
 }
 
-extern "C" fn write_impl(
+extern "C" fn write_raw(
     path: McxPath,
     offset: u64,
     buf: McxBuffer,
@@ -2574,7 +2634,7 @@ fn rollback_new_data_block(
     }
 }
 
-extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
+extern "C" fn truncate_raw(path: McxPath, len: u64) -> i32 {
     if let Err(rc) = require_writable() {
         return rc;
     }
@@ -2795,11 +2855,11 @@ extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
     disk_flush()
 }
 
-extern "C" fn sync_impl() -> i32 {
+extern "C" fn sync_raw() -> i32 {
     disk_flush()
 }
 
-extern "C" fn stat_impl(
+extern "C" fn stat_raw(
     path: McxPath,
     out_mode: *mut u16,
     out_size: *mut u64,
@@ -2826,7 +2886,7 @@ extern "C" fn stat_impl(
     0
 }
 
-extern "C" fn chmod_impl(path: McxPath, mode: u32) -> i32 {
+extern "C" fn chmod_raw(path: McxPath, mode: u32) -> i32 {
     if let Err(rc) = require_writable() {
         return rc;
     }
@@ -2847,7 +2907,7 @@ extern "C" fn chmod_impl(path: McxPath, mode: u32) -> i32 {
     write_inode_raw(ino, &inode_raw)
 }
 
-extern "C" fn chown_impl(path: McxPath, uid: u32, gid: u32) -> i32 {
+extern "C" fn chown_raw(path: McxPath, uid: u32, gid: u32) -> i32 {
     if let Err(rc) = require_writable() {
         return rc;
     }
@@ -2874,7 +2934,7 @@ extern "C" fn chown_impl(path: McxPath, uid: u32, gid: u32) -> i32 {
     write_inode_raw(ino, &inode_raw)
 }
 
-extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -> i32 {
+extern "C" fn readdir_raw(path: McxPath, buf: McxBuffer, out_len: *mut usize) -> i32 {
     if buf.ptr.is_null() || out_len.is_null() {
         return EINVAL;
     }
@@ -2944,6 +3004,91 @@ extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -
         *out_len = written;
     }
     0
+}
+
+fn path_in_directory(path: &[u8], directory: &[u8]) -> bool {
+    path == directory || (path.starts_with(directory) && path.get(directory.len()) == Some(&b'/'))
+}
+
+fn is_data_path(path: &[u8]) -> bool {
+    [b"/home".as_slice(), b"/var", b"/tmp", b"/system/users", b"/system/logs"]
+        .iter()
+        .any(|directory| path_in_directory(path, directory))
+}
+
+struct OperationGuard;
+
+impl OperationGuard {
+    fn acquire() -> Self {
+        while OPERATION_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        OPERATION_LOCK.store(false, Ordering::Release);
+    }
+}
+
+fn with_path_volume(path: McxPath, operation: impl FnOnce() -> i32) -> i32 {
+    let data_path = path_bytes(path).is_some_and(is_data_path);
+    let _guard = OperationGuard::acquire();
+    unsafe {
+        let volume = if data_path { STATE.data_volume.or(STATE.system_volume) } else { STATE.system_volume };
+        if let Some(volume) = volume {
+            STATE.partition_lba_base = volume.base;
+            STATE.partition_lba_count = volume.count;
+            STATE.sb = volume.sb;
+            STATE.writable = volume.writable;
+        }
+    }
+    operation()
+}
+
+extern "C" fn create_impl(path: McxPath, mode: u32, uid: u32, gid: u32) -> i32 {
+    with_path_volume(path, || create_raw(path, mode, uid, gid))
+}
+extern "C" fn remove_impl(path: McxPath, remove_directory: u32) -> i32 {
+    with_path_volume(path, || remove_raw(path, remove_directory))
+}
+extern "C" fn rename_impl(src: McxPath, dst: McxPath) -> i32 {
+    let Some(src_path) = path_bytes(src) else { return EINVAL; };
+    let Some(dst_path) = path_bytes(dst) else { return EINVAL; };
+    with_path_volume(src, || {
+        let data_volume = unsafe { STATE.data_volume };
+        if data_volume.is_some() && is_data_path(src_path) != is_data_path(dst_path) {
+            return -18; // EXDEV: rename must never move an inode across partitions.
+        }
+        rename_raw(src, dst)
+    })
+}
+extern "C" fn read_impl(path: McxPath, offset: u64, buf: McxBuffer, out_read: *mut usize) -> i32 {
+    with_path_volume(path, || read_raw(path, offset, buf, out_read))
+}
+extern "C" fn write_impl(path: McxPath, offset: u64, buf: McxBuffer, out_written: *mut usize) -> i32 {
+    with_path_volume(path, || write_raw(path, offset, buf, out_written))
+}
+extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
+    with_path_volume(path, || truncate_raw(path, len))
+}
+extern "C" fn stat_impl(path: McxPath, mode: *mut u16, size: *mut u64, uid: *mut u32, gid: *mut u32) -> i32 {
+    with_path_volume(path, || stat_raw(path, mode, size, uid, gid))
+}
+extern "C" fn chmod_impl(path: McxPath, mode: u32) -> i32 {
+    with_path_volume(path, || chmod_raw(path, mode))
+}
+extern "C" fn chown_impl(path: McxPath, uid: u32, gid: u32) -> i32 {
+    with_path_volume(path, || chown_raw(path, uid, gid))
+}
+extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -> i32 {
+    with_path_volume(path, || readdir_raw(path, buf, out_len))
+}
+extern "C" fn sync_impl() -> i32 {
+    let _guard = OperationGuard::acquire();
+    sync_raw()
 }
 
 static OPS: McxFsOps = McxFsOps {
@@ -3057,6 +3202,28 @@ mod tests {
         assert!(is_system_slot_entry(&entry, 2));
         entry[0] ^= 1;
         assert!(!is_system_slot_entry(&entry, 2));
+    }
+
+    #[test]
+    fn gpt_data_partition_is_matched_by_type_and_name() {
+        let mut entry = [0u8; 128];
+        entry[..16].copy_from_slice(&DATA_PARTITION_TYPE);
+        for (index, byte) in b"mochiOS Data".iter().enumerate() {
+            entry[56 + index * 2] = *byte;
+        }
+        assert!(is_data_entry(&entry));
+        entry[56] = b'X';
+        assert!(!is_data_entry(&entry));
+    }
+
+    #[test]
+    fn mutable_paths_are_routed_only_at_directory_boundaries() {
+        for path in [b"/home".as_slice(), b"/home/root", b"/var/config", b"/tmp/file", b"/system/users/users.db", b"/system/logs/audit.log"] {
+            assert!(is_data_path(path));
+        }
+        for path in [b"/".as_slice(), b"/homebrew", b"/variety", b"/system/users-old", b"/system/services/update.service"] {
+            assert!(!is_data_path(path));
+        }
     }
 
     fn superblock_with_features(
