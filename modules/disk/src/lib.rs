@@ -642,7 +642,10 @@ extern "C" fn flush_impl(disk_id: u32) -> i32 {
         return EINVAL;
     }
     if !FLUSH_SUPPORTED.load(Ordering::Acquire) {
-        return 0;
+        // A successful flush must mean that the device accepted a durability
+        // barrier. Silently treating an unsupported feature as success would
+        // make A/B state transitions unsafe after power loss.
+        return ENOSYS;
     }
     unsafe { submit_request(0, core::ptr::null_mut(), 0, false, true) }
 }

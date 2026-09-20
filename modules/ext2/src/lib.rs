@@ -8,11 +8,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use mochi_cext_abi::{
     EEXIST, EFBIG, EINVAL, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, EOVERFLOW, EROFS, MCX_CEXT_ABI,
-    MCX_FS_MOUNT_READ_ONLY, MCX_LOG_INFO, McxBuffer, McxDiskOps, McxFsOps, McxKernelApi, McxPath,
+    MCX_FS_MOUNT_READ_ONLY, MCX_LOG_BOOT, MCX_LOG_INFO, McxBuffer, McxDiskOps, McxFsOps,
+    McxKernelApi, McxPath,
 };
 
 const EXT2_MAGIC: u16 = 0xef53;
 const GPT_HEADER_SIGNATURE: &[u8; 8] = b"EFI PART";
+// GPT stores the first three UUID fields little-endian.
+const SYSTEM_PARTITION_TYPE: [u8; 16] = [
+    0x68, 0x63, 0x6f, 0x6d, 0x4f, 0x69, 0x00, 0x53,
+    0x80, 0x00, 0x6d, 0x50, 0x61, 0x72, 0x74, 0x01,
+];
 const ROOT_INO: u32 = 2;
 const S_IFDIR: u16 = 0x4000;
 const S_IFREG: u16 = 0x8000;
@@ -36,6 +42,7 @@ struct Superblock {
     blocks_count: u32,
     first_data_block: u32,
     block_size: u32,
+    last_write_time: u32,
     inode_size: u16,
     first_inode: u32,
     blocks_per_group: u32,
@@ -71,6 +78,7 @@ struct State {
     writable: bool,
     disk_id: u32,
     partition_lba_base: u64,
+    partition_lba_count: u64,
     sb: Superblock,
 }
 
@@ -80,10 +88,12 @@ static mut STATE: State = State {
     mounted: false,
     disk_id: 0,
     partition_lba_base: 0,
+    partition_lba_count: 0,
     sb: Superblock {
         blocks_count: 0,
         first_data_block: 0,
         block_size: 0,
+        last_write_time: 0,
         inode_size: 0,
         first_inode: 0,
         blocks_per_group: 0,
@@ -110,6 +120,15 @@ fn log_bytes(bytes: &[u8]) {
         let api = KERNEL_API;
         if !api.is_null() {
             ((*api).log)(MCX_LOG_INFO, bytes.as_ptr(), bytes.len());
+        }
+    }
+}
+
+fn log_boot_bytes(bytes: &[u8]) {
+    unsafe {
+        let api = KERNEL_API;
+        if !api.is_null() {
+            ((*api).log)(MCX_LOG_BOOT, bytes.as_ptr(), bytes.len());
         }
     }
 }
@@ -221,14 +240,35 @@ fn write_exact_raw(offset: u64, data: &[u8]) -> i32 {
     0
 }
 
+fn partition_offset(base_lba: u64, lba_count: u64, offset: u64, len: usize) -> Result<u64, i32> {
+    let base = base_lba.checked_mul(SECTOR_SIZE as u64).ok_or(EOVERFLOW)?;
+    let end = offset.checked_add(len as u64).ok_or(EOVERFLOW)?;
+    if lba_count != 0 {
+        let capacity = lba_count.checked_mul(SECTOR_SIZE as u64).ok_or(EOVERFLOW)?;
+        if end > capacity {
+            return Err(EINVAL);
+        }
+    }
+    base.checked_add(end).ok_or(EOVERFLOW)?;
+    base.checked_add(offset).ok_or(EOVERFLOW)
+}
+
 fn read_exact(offset: u64, out: &mut [u8]) -> i32 {
-    let base = unsafe { STATE.partition_lba_base } * SECTOR_SIZE as u64;
-    read_exact_raw(base + offset, out)
+    let (base, count) = unsafe { (STATE.partition_lba_base, STATE.partition_lba_count) };
+    let absolute = match partition_offset(base, count, offset, out.len()) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    read_exact_raw(absolute, out)
 }
 
 fn write_exact(offset: u64, data: &[u8]) -> i32 {
-    let base = unsafe { STATE.partition_lba_base } * SECTOR_SIZE as u64;
-    write_exact_raw(base + offset, data)
+    let (base, count) = unsafe { (STATE.partition_lba_base, STATE.partition_lba_count) };
+    let absolute = match partition_offset(base, count, offset, data.len()) {
+        Ok(value) => value,
+        Err(rc) => return rc,
+    };
+    write_exact_raw(absolute, data)
 }
 
 fn read_u16(offset: u64) -> Result<u16, i32> {
@@ -375,6 +415,7 @@ fn load_superblock() -> Result<Superblock, i32> {
         blocks_count: get_u32(&raw, 4),
         first_data_block: get_u32(&raw, 20),
         block_size,
+        last_write_time: get_u32(&raw, 48),
         inode_size,
         first_inode: get_u32(&raw, 84),
         blocks_per_group: get_u32(&raw, 32),
@@ -420,18 +461,54 @@ fn validate_write_access(writable: bool) -> Result<(), i32> {
     if writable { Ok(()) } else { Err(EROFS) }
 }
 
-fn try_mount_at_lba(base_lba: u64) -> Result<Superblock, i32> {
+fn try_mount_at_lba(base_lba: u64, lba_count: u64) -> Result<Superblock, i32> {
     unsafe {
         STATE.partition_lba_base = base_lba;
+        STATE.partition_lba_count = lba_count;
     }
-    load_superblock()
+    let sb = load_superblock()?;
+    if lba_count != 0 {
+        let filesystem_bytes = (sb.blocks_count as u64)
+            .checked_mul(sb.block_size as u64)
+            .ok_or(EINVAL)?;
+        let partition_bytes = lba_count.checked_mul(SECTOR_SIZE as u64).ok_or(EINVAL)?;
+        if filesystem_bytes > partition_bytes {
+            return Err(EINVAL);
+        }
+    }
+    Ok(sb)
+}
+
+fn is_system_slot_entry(entry: &[u8], slot: u32) -> bool {
+    let name = match slot {
+        1 => b"mochiOS System A".as_slice(),
+        2 => b"mochiOS System B".as_slice(),
+        _ => return false,
+    };
+    if entry.len() < 128 || entry[..16] != SYSTEM_PARTITION_TYPE {
+        return false;
+    }
+    for (index, byte) in name.iter().enumerate() {
+        if entry[56 + index * 2] != *byte || entry[57 + index * 2] != 0 {
+            return false;
+        }
+    }
+    entry[56 + name.len() * 2] == 0 && entry[57 + name.len() * 2] == 0
 }
 
 fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
-    match try_mount_at_lba(0) {
-        Ok(sb) => return Ok((0, sb)),
-        Err(rc) if rc != EINVAL => return Err(rc),
-        Err(_) => {}
+    let slot = unsafe {
+        KERNEL_API.as_ref().map(|api| (api.boot_system_slot)())
+    }.ok_or(ENOSYS)?;
+    if slot > 2 {
+        return Err(EINVAL);
+    }
+    if slot == 0 {
+        match try_mount_at_lba(0, 0) {
+            Ok(sb) => return Ok((0, sb)),
+            Err(rc) if rc != EINVAL => return Err(rc),
+            Err(_) => {}
+        }
     }
 
     let mut header = [0u8; SECTOR_SIZE];
@@ -452,6 +529,12 @@ fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
 
     let max_entries = core::cmp::min(entry_count, 128);
     let mut entry = [0u8; 512];
+    let first_usable_lba = get_u64(&header, 40);
+    let last_usable_lba = get_u64(&header, 48);
+    if first_usable_lba == 0 || last_usable_lba < first_usable_lba {
+        return Err(EINVAL);
+    }
+    let mut selected_partition = None;
     let mut index = 0u32;
     while index < max_entries {
         let offset = entries_lba
@@ -472,17 +555,34 @@ fn find_ext2_partition_lba() -> Result<(u64, Superblock), i32> {
         }
         if !empty_type {
             let first_lba = get_u64(&entry, 32);
+            let last_lba = get_u64(&entry, 40);
+            if first_lba < first_usable_lba || last_lba > last_usable_lba || last_lba < first_lba {
+                return Err(EINVAL);
+            }
+            let lba_count = last_lba
+                .checked_sub(first_lba)
+                .and_then(|span| span.checked_add(1))
+                .ok_or(EINVAL)?;
             if first_lba != 0 {
-                match try_mount_at_lba(first_lba) {
-                    Ok(sb) => return Ok((first_lba, sb)),
-                    Err(rc) if rc != EINVAL => return Err(rc),
-                    Err(_) => {}
+                if slot == 0 {
+                    match try_mount_at_lba(first_lba, lba_count) {
+                        Ok(sb) => return Ok((first_lba, sb)),
+                        Err(rc) if rc != EINVAL => return Err(rc),
+                        Err(_) => {}
+                    }
+                } else if is_system_slot_entry(&entry[..entry_size as usize], slot) {
+                    if selected_partition.replace((first_lba, lba_count)).is_some() {
+                        return Err(EINVAL);
+                    }
                 }
             }
         }
         index += 1;
     }
 
+    if let Some((lba, count)) = selected_partition {
+        return try_mount_at_lba(lba, count).map(|sb| (lba, sb));
+    }
     Err(EINVAL)
 }
 
@@ -1174,13 +1274,16 @@ fn require_writable() -> Result<(), i32> {
 }
 
 fn now_seconds() -> u32 {
-    unsafe {
+    let now = unsafe {
         if KERNEL_API.is_null() {
             0
         } else {
             ((*KERNEL_API).now_seconds)()
         }
-    }
+    };
+    // A guest without a synchronized clock may report 1970 even for a filesystem
+    // created later. Earlier deletion times look like corrupt orphan links to fsck.
+    now.max(superblock().last_write_time)
 }
 
 fn update_change_times(inode_raw: &mut [u8]) {
@@ -1898,8 +2001,14 @@ extern "C" fn mount_impl(device_id: u32, flags: u32) -> i32 {
                 STATE.mounted = true;
                 STATE.writable = writable;
                 READY.store(true, Ordering::Release);
-                0
             }
+            let slot = unsafe { KERNEL_API.as_ref().map(|api| (api.boot_system_slot)()) };
+            match slot {
+                Some(1) => log_boot_bytes(b"ext2.cext: mounted system A"),
+                Some(2) => log_boot_bytes(b"ext2.cext: mounted system B"),
+                _ => {}
+            }
+            0
         }
         Err(rc) => {
             if rc == EINVAL {
@@ -2935,6 +3044,21 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 mod tests {
     use super::*;
 
+    #[test]
+    fn gpt_system_slots_are_matched_by_type_and_name() {
+        let mut entry = [0u8; 128];
+        entry[..16].copy_from_slice(&SYSTEM_PARTITION_TYPE);
+        for (index, byte) in b"mochiOS System A".iter().enumerate() {
+            entry[56 + index * 2] = *byte;
+        }
+        assert!(is_system_slot_entry(&entry, 1));
+        assert!(!is_system_slot_entry(&entry, 2));
+        entry[56 + 15 * 2] = b'B';
+        assert!(is_system_slot_entry(&entry, 2));
+        entry[0] ^= 1;
+        assert!(!is_system_slot_entry(&entry, 2));
+    }
+
     fn superblock_with_features(
         feature_compat: u32,
         feature_incompat: u32,
@@ -2944,6 +3068,7 @@ mod tests {
             blocks_count: 64,
             first_data_block: 1,
             block_size: 1024,
+            last_write_time: 0,
             inode_size: 128,
             first_inode: 11,
             blocks_per_group: 64,
@@ -2977,6 +3102,18 @@ mod tests {
     fn read_only_mount_rejects_mutation() {
         assert_eq!(validate_write_access(false), Err(EROFS));
         assert_eq!(validate_write_access(true), Ok(()));
+    }
+
+    #[test]
+    fn partition_io_cannot_cross_into_the_next_gpt_partition() {
+        let base_lba = 2048;
+        let lba_count = 8;
+        assert_eq!(partition_offset(base_lba, lba_count, 0, 4096), Ok(1_048_576));
+        assert_eq!(partition_offset(base_lba, lba_count, 4095, 1), Ok(1_052_671));
+        assert_eq!(partition_offset(base_lba, lba_count, 4095, 2), Err(EINVAL));
+        assert_eq!(partition_offset(base_lba, lba_count, 4096, 1), Err(EINVAL));
+        assert_eq!(partition_offset(base_lba, lba_count, u64::MAX, 1), Err(EOVERFLOW));
+        assert_eq!(partition_offset(u64::MAX, 0, 0, 1), Err(EOVERFLOW));
     }
 
     #[test]

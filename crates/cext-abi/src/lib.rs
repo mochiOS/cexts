@@ -16,6 +16,8 @@ pub struct McxKernelApi {
     pub log: extern "C" fn(level: u32, ptr: *const u8, len: usize),
     pub register_irq: extern "C" fn(irq: u8, handler: extern "C" fn(u8)) -> i32,
     pub now_seconds: extern "C" fn() -> u32,
+    /// 0 for legacy images, 1 for system A, 2 for system B.
+    pub boot_system_slot: extern "C" fn() -> u32,
 }
 
 #[repr(C)]
@@ -65,12 +67,14 @@ pub struct McxFsOps {
     pub sync: extern "C" fn() -> i32,
 }
 
-pub const MCX_CEXT_ABI: u16 = 3;
+pub const MCX_CEXT_ABI: u16 = 4;
 pub const MCX_FS_MOUNT_READ_ONLY: u32 = 1;
 pub const MCX_LOG_ERROR: u32 = 0;
 pub const MCX_LOG_WARN: u32 = 1;
 pub const MCX_LOG_INFO: u32 = 2;
 pub const MCX_LOG_DEBUG: u32 = 3;
+/// Small boot milestones that must also appear in release serial output.
+pub const MCX_LOG_BOOT: u32 = 4;
 
 pub const ENOENT: i32 = -2;
 pub const EIO: i32 = -5;

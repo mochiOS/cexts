@@ -2,7 +2,7 @@
 id = "org.mochios.cexts.disk"
 name = "disk"
 version = 1
-abi = 3
+abi = 4
 entry = "entry"
 
 [load]
