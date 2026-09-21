@@ -3010,10 +3010,18 @@ fn path_in_directory(path: &[u8], directory: &[u8]) -> bool {
     path == directory || (path.starts_with(directory) && path.get(directory.len()) == Some(&b'/'))
 }
 
-fn is_data_path(path: &[u8]) -> bool {
-    [b"/home".as_slice(), b"/var", b"/tmp", b"/system/users", b"/system/logs"]
+fn is_system_path(path: &[u8]) -> bool {
+    path_in_directory(path, b"/system")
+}
+
+fn is_overlay_path(path: &[u8]) -> bool {
+    [b"/bin".as_slice(), b"/applications"]
         .iter()
         .any(|directory| path_in_directory(path, directory))
+}
+
+fn is_overlay_root(path: &[u8]) -> bool {
+    matches!(path, b"/bin" | b"/applications")
 }
 
 struct OperationGuard;
@@ -3033,58 +3041,158 @@ impl Drop for OperationGuard {
     }
 }
 
-fn with_path_volume(path: McxPath, operation: impl FnOnce() -> i32) -> i32 {
-    let data_path = path_bytes(path).is_some_and(is_data_path);
-    let _guard = OperationGuard::acquire();
+fn select_volume(volume: Volume) {
     unsafe {
-        let volume = if data_path { STATE.data_volume.or(STATE.system_volume) } else { STATE.system_volume };
-        if let Some(volume) = volume {
-            STATE.partition_lba_base = volume.base;
-            STATE.partition_lba_count = volume.count;
-            STATE.sb = volume.sb;
-            STATE.writable = volume.writable;
+        STATE.partition_lba_base = volume.base;
+        STATE.partition_lba_count = volume.count;
+        STATE.sb = volume.sb;
+        STATE.writable = volume.writable;
+    }
+}
+
+fn system_overlay_path<'a>(path: &[u8], storage: &'a mut [u8; 4096]) -> Result<McxPath, i32> {
+    let len = path.len().checked_add(b"/system".len()).ok_or(EINVAL)?;
+    if len > storage.len() { return Err(EINVAL); }
+    storage[..7].copy_from_slice(b"/system");
+    storage[7..len].copy_from_slice(path);
+    Ok(McxPath { ptr: storage.as_ptr(), len })
+}
+
+fn with_read_volume(path: McxPath, operation: impl FnOnce(McxPath) -> i32) -> i32 {
+    let Some(bytes) = path_bytes(path) else { return EINVAL; };
+    let _guard = OperationGuard::acquire();
+    let (system, data) = unsafe { (STATE.system_volume, STATE.data_volume) };
+    let Some(system) = system else { return ENOSYS; };
+    let data = data.unwrap_or(system);
+    if is_system_path(bytes) {
+        select_volume(system);
+        return operation(path);
+    }
+    if is_overlay_path(bytes) && !is_overlay_root(bytes) {
+        let mut storage = [0u8; 4096];
+        let mapped = match system_overlay_path(bytes, &mut storage) {
+            Ok(mapped) => mapped,
+            Err(rc) => return rc,
+        };
+        select_volume(system);
+        match resolve_path(unsafe { core::slice::from_raw_parts(mapped.ptr, mapped.len) }) {
+            Ok(_) => return operation(mapped),
+            Err(ENOENT) => {}
+            Err(rc) => return rc,
         }
     }
-    operation()
+    select_volume(data);
+    operation(path)
+}
+
+fn with_write_volume(path: McxPath, operation: impl FnOnce(McxPath) -> i32) -> i32 {
+    let Some(bytes) = path_bytes(path) else { return EINVAL; };
+    let _guard = OperationGuard::acquire();
+    let (system, data) = unsafe { (STATE.system_volume, STATE.data_volume) };
+    let Some(system) = system else { return ENOSYS; };
+    let data = data.unwrap_or(system);
+    if is_system_path(bytes) { return EROFS; }
+    if is_overlay_path(bytes) && !is_overlay_root(bytes) {
+        let mut storage = [0u8; 4096];
+        let mapped = match system_overlay_path(bytes, &mut storage) {
+            Ok(mapped) => mapped,
+            Err(rc) => return rc,
+        };
+        select_volume(system);
+        match resolve_path(unsafe { core::slice::from_raw_parts(mapped.ptr, mapped.len) }) {
+            Ok(_) => return EROFS,
+            Err(ENOENT) => {}
+            Err(rc) => return rc,
+        }
+    }
+    select_volume(data);
+    operation(path)
 }
 
 extern "C" fn create_impl(path: McxPath, mode: u32, uid: u32, gid: u32) -> i32 {
-    with_path_volume(path, || create_raw(path, mode, uid, gid))
+    with_write_volume(path, |path| create_raw(path, mode, uid, gid))
 }
 extern "C" fn remove_impl(path: McxPath, remove_directory: u32) -> i32 {
-    with_path_volume(path, || remove_raw(path, remove_directory))
+    with_write_volume(path, |path| remove_raw(path, remove_directory))
 }
 extern "C" fn rename_impl(src: McxPath, dst: McxPath) -> i32 {
     let Some(src_path) = path_bytes(src) else { return EINVAL; };
     let Some(dst_path) = path_bytes(dst) else { return EINVAL; };
-    with_path_volume(src, || {
-        let data_volume = unsafe { STATE.data_volume };
-        if data_volume.is_some() && is_data_path(src_path) != is_data_path(dst_path) {
-            return -18; // EXDEV: rename must never move an inode across partitions.
+    with_write_volume(src, |_| {
+        let (system, data) = unsafe { (STATE.system_volume, STATE.data_volume) };
+        let Some(system) = system else { return ENOSYS; };
+        let data = data.unwrap_or(system);
+        if is_system_path(src_path) || is_system_path(dst_path) { return -18; }
+        if is_overlay_path(dst_path) && !is_overlay_root(dst_path) {
+            let mut storage = [0u8; 4096];
+            let mapped = match system_overlay_path(dst_path, &mut storage) {
+                Ok(mapped) => mapped,
+                Err(rc) => return rc,
+            };
+            select_volume(system);
+            let exists = resolve_path(unsafe { core::slice::from_raw_parts(mapped.ptr, mapped.len) });
+            select_volume(data);
+            match exists {
+                Ok(_) => return EROFS,
+                Err(ENOENT) => {}
+                Err(rc) => return rc,
+            }
         }
         rename_raw(src, dst)
     })
 }
 extern "C" fn read_impl(path: McxPath, offset: u64, buf: McxBuffer, out_read: *mut usize) -> i32 {
-    with_path_volume(path, || read_raw(path, offset, buf, out_read))
+    with_read_volume(path, |path| read_raw(path, offset, buf, out_read))
 }
 extern "C" fn write_impl(path: McxPath, offset: u64, buf: McxBuffer, out_written: *mut usize) -> i32 {
-    with_path_volume(path, || write_raw(path, offset, buf, out_written))
+    with_write_volume(path, |path| write_raw(path, offset, buf, out_written))
 }
 extern "C" fn truncate_impl(path: McxPath, len: u64) -> i32 {
-    with_path_volume(path, || truncate_raw(path, len))
+    with_write_volume(path, |path| truncate_raw(path, len))
 }
 extern "C" fn stat_impl(path: McxPath, mode: *mut u16, size: *mut u64, uid: *mut u32, gid: *mut u32) -> i32 {
-    with_path_volume(path, || stat_raw(path, mode, size, uid, gid))
+    with_read_volume(path, |path| stat_raw(path, mode, size, uid, gid))
 }
 extern "C" fn chmod_impl(path: McxPath, mode: u32) -> i32 {
-    with_path_volume(path, || chmod_raw(path, mode))
+    with_write_volume(path, |path| chmod_raw(path, mode))
 }
 extern "C" fn chown_impl(path: McxPath, uid: u32, gid: u32) -> i32 {
-    with_path_volume(path, || chown_raw(path, uid, gid))
+    with_write_volume(path, |path| chown_raw(path, uid, gid))
 }
 extern "C" fn readdir_impl(path: McxPath, buf: McxBuffer, out_len: *mut usize) -> i32 {
-    with_path_volume(path, || readdir_raw(path, buf, out_len))
+    let Some(bytes) = path_bytes(path) else { return EINVAL; };
+    if !is_overlay_root(bytes) {
+        return with_read_volume(path, |path| readdir_raw(path, buf, out_len));
+    }
+    let _guard = OperationGuard::acquire();
+    let (system, data) = unsafe { (STATE.system_volume, STATE.data_volume) };
+    let Some(system) = system else { return ENOSYS; };
+    let data = data.unwrap_or(system);
+    select_volume(data);
+    let rc = readdir_raw(path, buf, out_len);
+    if rc != 0 { return rc; }
+    let mut storage = [0u8; 4096];
+    let mapped = match system_overlay_path(bytes, &mut storage) {
+        Ok(mapped) => mapped,
+        Err(rc) => return rc,
+    };
+    let mut system_entries = [0u8; 4096];
+    let mut system_len = 0usize;
+    select_volume(system);
+    let rc = readdir_raw(mapped, McxBuffer { ptr: system_entries.as_mut_ptr(), len: system_entries.len() }, &mut system_len);
+    if rc != 0 { return rc; }
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf.ptr, buf.len) };
+    let mut written = unsafe { *out_len };
+    for entry in system_entries[..system_len].split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+        if dst[..written].split(|byte| *byte == 0).any(|existing| existing == entry) { continue; }
+        if written + entry.len() + 1 > dst.len() { break; }
+        dst[written..written + entry.len()].copy_from_slice(entry);
+        written += entry.len();
+        dst[written] = 0;
+        written += 1;
+    }
+    unsafe { *out_len = written; }
+    0
 }
 extern "C" fn sync_impl() -> i32 {
     let _guard = OperationGuard::acquire();
@@ -3217,12 +3325,15 @@ mod tests {
     }
 
     #[test]
-    fn mutable_paths_are_routed_only_at_directory_boundaries() {
-        for path in [b"/home".as_slice(), b"/home/root", b"/var/config", b"/tmp/file", b"/system/users/users.db", b"/system/logs/audit.log"] {
-            assert!(is_data_path(path));
+    fn system_and_overlay_roots_match_only_at_directory_boundaries() {
+        assert!(is_system_path(b"/system"));
+        assert!(is_system_path(b"/system/applications/Binder.app"));
+        assert!(!is_system_path(b"/system-old"));
+        for path in [b"/bin".as_slice(), b"/bin/msh", b"/applications/Foo.app"] {
+            assert!(is_overlay_path(path));
         }
-        for path in [b"/".as_slice(), b"/homebrew", b"/variety", b"/system/users-old", b"/system/services/update.service"] {
-            assert!(!is_data_path(path));
+        for path in [b"/binary".as_slice(), b"/applications-old", b"/libraries/fonts/custom.ttf", b"/var/config", b"/home/root"] {
+            assert!(!is_overlay_path(path));
         }
     }
 
