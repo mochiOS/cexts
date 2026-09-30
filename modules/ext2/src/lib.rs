@@ -2460,6 +2460,16 @@ extern "C" fn write_raw(
         Ok(v) => v,
         Err(rc) => return rc,
     };
+    write_open_inode(ino, inode, offset, buf, out_written)
+}
+
+fn write_open_inode(
+    ino: u32,
+    inode: Inode,
+    offset: u64,
+    buf: McxBuffer,
+    out_written: *mut usize,
+) -> i32 {
     if !is_file(inode.mode) {
         return EISDIR;
     }
@@ -3365,6 +3375,31 @@ extern "C" fn stat_handle_impl(
     0
 }
 
+extern "C" fn write_handle_impl(
+    handle: u64,
+    offset: u64,
+    buf: McxBuffer,
+    out_written: *mut usize,
+) -> i32 {
+    if buf.ptr.is_null() || out_written.is_null() {
+        return EINVAL;
+    }
+    let _guard = OperationGuard::acquire();
+    let node = match open_node(handle) {
+        Ok(node) => node,
+        Err(rc) => return rc,
+    };
+    select_volume(node.volume);
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
+    let inode = match load_inode(node.ino) {
+        Ok(inode) => inode,
+        Err(rc) => return rc,
+    };
+    write_open_inode(node.ino, inode, offset, buf, out_written)
+}
+
 static OPS: McxFsOps = McxFsOps {
     mount: mount_impl,
     set_disk_ops: set_disk_ops_impl,
@@ -3383,6 +3418,7 @@ static OPS: McxFsOps = McxFsOps {
     close_handle: close_handle_impl,
     read_handle: read_handle_impl,
     stat_handle: stat_handle_impl,
+    write_handle: write_handle_impl,
 };
 
 #[unsafe(no_mangle)]
