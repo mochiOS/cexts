@@ -124,8 +124,72 @@ static mut STATE: State = State {
 };
 static mut KERNEL_API: *const McxKernelApi = core::ptr::null();
 
+const MAX_OPEN_NODES: usize = 256;
+
+#[derive(Clone, Copy)]
+struct OpenNode {
+    generation: u32,
+    volume: Volume,
+    ino: u32,
+}
+
+static mut OPEN_NODES: [Option<OpenNode>; MAX_OPEN_NODES] = [None; MAX_OPEN_NODES];
+static mut OPEN_NODE_GENERATIONS: [u32; MAX_OPEN_NODES] = [0; MAX_OPEN_NODES];
+
 fn superblock() -> Superblock {
     unsafe { STATE.sb }
+}
+
+fn selected_volume() -> Volume {
+    unsafe {
+        Volume {
+            base: STATE.partition_lba_base,
+            count: STATE.partition_lba_count,
+            sb: STATE.sb,
+            writable: STATE.writable,
+        }
+    }
+}
+
+fn allocate_open_node(volume: Volume, ino: u32) -> Result<u64, i32> {
+    unsafe {
+        let nodes = core::ptr::addr_of_mut!(OPEN_NODES).cast::<Option<OpenNode>>();
+        let generations = core::ptr::addr_of_mut!(OPEN_NODE_GENERATIONS).cast::<u32>();
+        let mut index = 0usize;
+        while index < MAX_OPEN_NODES && nodes.add(index).read().is_some() {
+            index += 1;
+        }
+        if index == MAX_OPEN_NODES {
+            return Err(ENOSPC);
+        }
+        let generation = generations.add(index).read().wrapping_add(1).max(1);
+        generations.add(index).write(generation);
+        nodes.add(index).write(Some(OpenNode {
+            generation,
+            volume,
+            ino,
+        }));
+        Ok((u64::from(generation) << 32) | (index as u64 + 1))
+    }
+}
+
+fn open_node(handle: u64) -> Result<OpenNode, i32> {
+    let raw_index = (handle as u32).checked_sub(1).ok_or(EINVAL)? as usize;
+    let generation = (handle >> 32) as u32;
+    if raw_index >= MAX_OPEN_NODES {
+        return Err(EINVAL);
+    }
+    let node = unsafe {
+        core::ptr::addr_of!(OPEN_NODES)
+            .cast::<Option<OpenNode>>()
+            .add(raw_index)
+            .read()
+    }
+    .ok_or(EINVAL)?;
+    if node.generation != generation {
+        return Err(EINVAL);
+    }
+    Ok(node)
 }
 
 fn state_is_writable() -> bool {
@@ -3199,6 +3263,108 @@ extern "C" fn sync_impl() -> i32 {
     sync_raw()
 }
 
+extern "C" fn open_handle_impl(path: McxPath, out_handle: *mut u64) -> i32 {
+    if out_handle.is_null() {
+        return EINVAL;
+    }
+    with_read_volume(path, |resolved_path| {
+        let Some(path) = path_bytes(resolved_path) else {
+            return EINVAL;
+        };
+        let (ino, _) = match resolve_path(path) {
+            Ok(node) => node,
+            Err(rc) => return rc,
+        };
+        match allocate_open_node(selected_volume(), ino) {
+            Ok(handle) => {
+                unsafe { *out_handle = handle };
+                0
+            }
+            Err(rc) => rc,
+        }
+    })
+}
+
+extern "C" fn close_handle_impl(handle: u64) -> i32 {
+    let _guard = OperationGuard::acquire();
+    let raw_index = match (handle as u32).checked_sub(1) {
+        Some(index) => index as usize,
+        None => return EINVAL,
+    };
+    let generation = (handle >> 32) as u32;
+    if raw_index >= MAX_OPEN_NODES {
+        return EINVAL;
+    }
+    let slot = unsafe {
+        core::ptr::addr_of_mut!(OPEN_NODES)
+            .cast::<Option<OpenNode>>()
+            .add(raw_index)
+    };
+    if !unsafe { slot.read() }.is_some_and(|node| node.generation == generation) {
+        return EINVAL;
+    }
+    unsafe { slot.write(None) };
+    0
+}
+
+extern "C" fn read_handle_impl(
+    handle: u64,
+    offset: u64,
+    buf: McxBuffer,
+    out_read: *mut usize,
+) -> i32 {
+    if buf.ptr.is_null() || out_read.is_null() {
+        return EINVAL;
+    }
+    let _guard = OperationGuard::acquire();
+    let node = match open_node(handle) {
+        Ok(node) => node,
+        Err(rc) => return rc,
+    };
+    select_volume(node.volume);
+    let inode = match load_inode(node.ino) {
+        Ok(inode) => inode,
+        Err(rc) => return rc,
+    };
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf.ptr, buf.len) };
+    match read_file_bytes(inode, offset, dst) {
+        Ok(read) => {
+            unsafe { *out_read = read };
+            0
+        }
+        Err(rc) => rc,
+    }
+}
+
+extern "C" fn stat_handle_impl(
+    handle: u64,
+    out_mode: *mut u16,
+    out_size: *mut u64,
+    out_uid: *mut u32,
+    out_gid: *mut u32,
+) -> i32 {
+    if out_mode.is_null() || out_size.is_null() || out_uid.is_null() || out_gid.is_null() {
+        return EINVAL;
+    }
+    let _guard = OperationGuard::acquire();
+    let node = match open_node(handle) {
+        Ok(node) => node,
+        Err(rc) => return rc,
+    };
+    select_volume(node.volume);
+    let inode = match load_inode(node.ino) {
+        Ok(inode) => inode,
+        Err(rc) => return rc,
+    };
+    unsafe {
+        *out_mode = inode.mode;
+        *out_size = inode.size as u64;
+        *out_uid = inode.uid;
+        *out_gid = inode.gid;
+    }
+    0
+}
+
 static OPS: McxFsOps = McxFsOps {
     mount: mount_impl,
     set_disk_ops: set_disk_ops_impl,
@@ -3213,6 +3379,10 @@ static OPS: McxFsOps = McxFsOps {
     chown: chown_impl,
     readdir: readdir_impl,
     sync: sync_impl,
+    open_handle: open_handle_impl,
+    close_handle: close_handle_impl,
+    read_handle: read_handle_impl,
+    stat_handle: stat_handle_impl,
 };
 
 #[unsafe(no_mangle)]
