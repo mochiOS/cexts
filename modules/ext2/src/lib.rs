@@ -2719,6 +2719,10 @@ extern "C" fn truncate_raw(path: McxPath, len: u64) -> i32 {
         Ok(v) => v,
         Err(rc) => return rc,
     };
+    truncate_open_inode(ino, inode, len)
+}
+
+fn truncate_open_inode(ino: u32, inode: Inode, len: u64) -> i32 {
     if !is_file(inode.mode) {
         return EISDIR;
     }
@@ -3400,6 +3404,23 @@ extern "C" fn write_handle_impl(
     write_open_inode(node.ino, inode, offset, buf, out_written)
 }
 
+extern "C" fn truncate_handle_impl(handle: u64, len: u64) -> i32 {
+    let _guard = OperationGuard::acquire();
+    let node = match open_node(handle) {
+        Ok(node) => node,
+        Err(rc) => return rc,
+    };
+    select_volume(node.volume);
+    if let Err(rc) = require_writable() {
+        return rc;
+    }
+    let inode = match load_inode(node.ino) {
+        Ok(inode) => inode,
+        Err(rc) => return rc,
+    };
+    truncate_open_inode(node.ino, inode, len)
+}
+
 static OPS: McxFsOps = McxFsOps {
     mount: mount_impl,
     set_disk_ops: set_disk_ops_impl,
@@ -3419,6 +3440,7 @@ static OPS: McxFsOps = McxFsOps {
     read_handle: read_handle_impl,
     stat_handle: stat_handle_impl,
     write_handle: write_handle_impl,
+    truncate_handle: truncate_handle_impl,
 };
 
 #[unsafe(no_mangle)]
