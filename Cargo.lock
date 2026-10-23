@@ -7,15 +7,120 @@ name = "mochi-cext-abi"
 version = "0.1.0"
 
 [[package]]
+name = "mochi-cext-abi"
+version = "0.1.0"
+source = "git+https://github.com/mochiOS/cexts#342b2015562dedfee4dacf85559127f44405c74f"
+
+[[package]]
 name = "mochi-disk-cext"
 version = "0.1.0"
 dependencies = [
- "mochi-cext-abi",
+ "mochi-cext-abi 0.1.0 (git+https://github.com/mochiOS/cexts)",
 ]
 
 [[package]]
 name = "mochi-ext2-cext"
 version = "0.1.0"
 dependencies = [
- "mochi-cext-abi",
+ "mochi-cext-abi 0.1.0 (git+https://github.com/mochiOS/cexts)",
 ]
+
+[[patch.unused]]
+name = "mboot-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mnu"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mnu-abi"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "mnu-abi"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
+
+[[patch.unused]]
+name = "mochi-user-platform"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochi-user-runtime"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochi-user-syscall"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-capability-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-filesystem-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linux-gui-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linux-portal-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-net-device-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-posix-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-posix-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-signature-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-tls-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-database"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-viewkit-gpu-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-virtio-gpu-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-workspace-protocol"
+version = "0.1.0"
