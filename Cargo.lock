@@ -7,22 +7,17 @@ name = "mochi-cext-abi"
 version = "0.1.0"
 
 [[package]]
-name = "mochi-cext-abi"
-version = "0.1.0"
-source = "git+https://github.com/mochiOS/cexts#342b2015562dedfee4dacf85559127f44405c74f"
-
-[[package]]
 name = "mochi-disk-cext"
 version = "0.1.0"
 dependencies = [
- "mochi-cext-abi 0.1.0 (git+https://github.com/mochiOS/cexts)",
+ "mochi-cext-abi",
 ]
 
 [[package]]
 name = "mochi-ext2-cext"
 version = "0.1.0"
 dependencies = [
- "mochi-cext-abi 0.1.0 (git+https://github.com/mochiOS/cexts)",
+ "mochi-cext-abi",
 ]
 
 [[patch.unused]]
@@ -30,24 +25,12 @@ name = "mboot-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
 name = "mnu"
 version = "0.1.0"
-
-[[patch.unused]]
-name = "mnu-abi"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "libc"
-version = "0.2.190"
-
-[[patch.unused]]
-name = "viewkit"
-version = "2.0.0"
-
-[[patch.unused]]
-name = "libc"
-version = "0.2.190"
 
 [[patch.unused]]
 name = "mnu-abi"
@@ -124,3 +107,15 @@ version = "0.1.0"
 [[patch.unused]]
 name = "mochios-workspace-protocol"
 version = "0.1.0"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "mnu-abi"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "viewkit"
+version = "2.0.0"
