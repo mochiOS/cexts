@@ -21,28 +21,12 @@ dependencies = [
 ]
 
 [[patch.unused]]
-name = "libc"
-version = "0.2.190"
-
-[[patch.unused]]
-name = "mnu-abi"
+name = "bootui"
 version = "0.1.0"
 
 [[patch.unused]]
 name = "viewkit"
 version = "2.0.0"
-
-[[patch.unused]]
-name = "mboot-protocol"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "mnu"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "mnu-abi"
-version = "0.1.0"
 
 [[patch.unused]]
 name = "mochi-user-platform"
@@ -110,6 +94,30 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-workspace-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mboot-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mnu"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mnu-abi"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-fonts"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.190"
+
+[[patch.unused]]
+name = "mnu-abi"
 version = "0.1.0"
 
 [[patch.unused]]
